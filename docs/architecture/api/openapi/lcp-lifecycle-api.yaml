@@ -1,0 +1,260 @@
+openapi: 3.0.3
+info:
+  title: LCP Lifecycle Policy API
+  description: |
+    Per-dataset lifecycle policy management.
+
+    Each dataset can hold multiple policies (uniqueness is per
+    ``(dataset_uuid, policy_name)``).  A policy describes:
+
+    - **tier_rules**: hot / warm / cold tier transitions
+    - **ttl_days**: TTL for hard delete (``null`` = never)
+    - **compaction_threshold**: when to trigger a compaction job
+    - **index_optimize_cron**: cron expression for periodic index optimize
+
+    The lifecycle worker (out of scope for this API) reads these rows and
+    schedules ``Tasks`` accordingly.
+  version: 1.0.0
+servers:
+  - url: https://lcp.example.com/api/v1
+  - url: http://localhost:8080/api/v1
+
+tags:
+  - name: lifecycle
+    description: Dataset lifecycle policy management
+
+paths:
+  /datasets/{dataset_uuid}/lifecycle-policies:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+    post:
+      tags: [lifecycle]
+      summary: Create a lifecycle policy
+      operationId: createLifecyclePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyCreateRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    get:
+      tags: [lifecycle]
+      summary: List lifecycle policies for the dataset
+      operationId: listLifecyclePolicies
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyListResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasets/{dataset_uuid}/lifecycle-policies/{policy_name}:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+      - $ref: '#/components/parameters/PolicyName'
+    get:
+      tags: [lifecycle]
+      summary: Get policy detail
+      operationId: getLifecyclePolicy
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [lifecycle]
+      summary: Update policy fields
+      operationId: updateLifecyclePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [lifecycle]
+      summary: Delete a policy
+      operationId: deleteLifecyclePolicy
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasets/{dataset_uuid}/lifecycle-policies/{policy_name}/enable:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+      - $ref: '#/components/parameters/PolicyName'
+    post:
+      tags: [lifecycle]
+      summary: Enable the policy
+      operationId: enableLifecyclePolicy
+      responses:
+        '200':
+          description: Enabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasets/{dataset_uuid}/lifecycle-policies/{policy_name}/disable:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+      - $ref: '#/components/parameters/PolicyName'
+    post:
+      tags: [lifecycle]
+      summary: Disable the policy
+      operationId: disableLifecyclePolicy
+      responses:
+        '200':
+          description: Disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PolicyResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    DatasetUuid:
+      name: dataset_uuid
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PolicyName:
+      name: policy_name
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 128 }
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Resource already exists
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, example: NOT_FOUND }
+        message: { type: string }
+        request_id: { type: string }
+
+    TierRules:
+      type: object
+      description: Free-form tier transition rules
+      additionalProperties: true
+      example:
+        hot_to_warm_days: 30
+        warm_to_cold_days: 180
+
+    CompactionThreshold:
+      type: object
+      description: Free-form compaction trigger thresholds
+      additionalProperties: true
+      example:
+        min_small_fragments: 100
+        window: 1h
+
+    PolicyCreateRequest:
+      type: object
+      required: [policy_name]
+      properties:
+        policy_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          example: standard-90d
+        tier_rules: { $ref: '#/components/schemas/TierRules' }
+        ttl_days:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Delete rows older than N days; null disables TTL
+        compaction_threshold: { $ref: '#/components/schemas/CompactionThreshold' }
+        index_optimize_cron:
+          type: string
+          maxLength: 64
+          example: 0 2 * * *
+        enabled:
+          type: boolean
+          default: true
+
+    PolicyUpdateRequest:
+      type: object
+      description: All fields optional; only the supplied fields are mutated.
+      properties:
+        tier_rules: { $ref: '#/components/schemas/TierRules' }
+        ttl_days:
+          type: integer
+          minimum: 1
+          nullable: true
+        compaction_threshold: { $ref: '#/components/schemas/CompactionThreshold' }
+        index_optimize_cron:
+          type: string
+          maxLength: 64
+
+    PolicyResponse:
+      type: object
+      required: [policy_name, dataset_uuid, enabled, created_at]
+      properties:
+        policy_name: { type: string }
+        dataset_uuid: { type: string, format: uuid }
+        tier_rules: { $ref: '#/components/schemas/TierRules' }
+        ttl_days:
+          type: integer
+          nullable: true
+        compaction_threshold: { $ref: '#/components/schemas/CompactionThreshold' }
+        index_optimize_cron:
+          type: string
+          nullable: true
+        enabled: { type: boolean }
+        last_run_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    PolicyListResponse:
+      type: object
+      properties:
+        total: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/PolicyResponse' }

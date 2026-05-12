@@ -477,6 +477,202 @@ class TestIndexesRouter:
 
 
 # ---------------------------------------------------------------------------
+# lifecycle policies
+# ---------------------------------------------------------------------------
+
+
+class TestLifecycleRouter:
+
+    async def _create_dataset(
+        self, http_client: Any, token: str, *, table: str = "t1",
+    ) -> str:
+        """Helper: create a dataset and return its uuid."""
+
+        resp = await http_client.post(
+            "/v1/datasets",
+            headers=_auth(token),
+            json={
+                "catalog": "c",
+                "schema": "s",
+                "table": table,
+                "storage_uri": "s3://b/p",
+            },
+        )
+        return resp.json()["dataset_uuid"]
+
+    async def test_list_policies_empty(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-list")
+        ds_uuid = await self._create_dataset(http_client, token)
+        resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"total": 0, "items": []}
+
+    async def test_list_policies_unknown_dataset_returns_404(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-404")
+        resp = await http_client.get(
+            "/v1/datasets/no-such/lifecycle-policies", headers=_auth(token),
+        )
+        assert resp.status_code == 404
+
+    async def test_create_policy_returns_201(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-create")
+        ds_uuid = await self._create_dataset(http_client, token)
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token),
+            json={
+                "policy_name": "standard-90d",
+                "ttl_days": 90,
+                "tier_rules": {"hot_to_warm_days": 30},
+            },
+        )
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["policy_name"] == "standard-90d"
+        assert body["ttl_days"] == 90
+        assert body["enabled"] is True
+
+    async def test_create_duplicate_policy_returns_409(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-dup")
+        ds_uuid = await self._create_dataset(http_client, token)
+        payload = {"policy_name": "dup"}
+        first = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token), json=payload,
+        )
+        second = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token), json=payload,
+        )
+        assert first.status_code == 201
+        assert second.status_code == 409
+        assert second.json()["detail"]["code"] == "ALREADY_EXISTS"
+
+    async def test_get_policy_round_trip(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-get")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token),
+            json={"policy_name": "my-pol", "ttl_days": 30},
+        )
+        resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/my-pol",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["policy_name"] == "my-pol"
+
+    async def test_patch_policy_only_supplied_fields(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-patch")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token),
+            json={
+                "policy_name": "p",
+                "ttl_days": 30,
+                "index_optimize_cron": "0 1 * * *",
+            },
+        )
+        resp = await http_client.patch(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/p",
+            headers=_auth(token),
+            json={"ttl_days": 60},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ttl_days"] == 60
+        # Field not in PATCH payload must keep its prior value.
+        assert body["index_optimize_cron"] == "0 1 * * *"
+
+    async def test_disable_then_enable_policy(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-toggle")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token),
+            json={"policy_name": "p"},
+        )
+        disabled = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/p/disable",
+            headers=_auth(token),
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["enabled"] is False
+
+        enabled = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/p/enable",
+            headers=_auth(token),
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["enabled"] is True
+
+    async def test_delete_policy_returns_204(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-pol-del")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token),
+            json={"policy_name": "p"},
+        )
+        resp = await http_client.delete(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/p",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 204
+        # Subsequent GET must be 404.
+        get_resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/p",
+            headers=_auth(token),
+        )
+        assert get_resp.status_code == 404
+
+    async def test_tenant_isolation_via_parent_dataset(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """Tenant B must not see tenant A's policy via direct URL."""
+
+        token_a = issue_token(tenant_id="tenant-a")
+        token_b = issue_token(tenant_id="tenant-b")
+        ds_uuid = await self._create_dataset(http_client, token_a, table="isolated")
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies",
+            headers=_auth(token_a),
+            json={"policy_name": "secret"},
+        )
+        resp_b = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/secret",
+            headers=_auth(token_b),
+        )
+        assert resp_b.status_code == 404
+        resp_a = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/lifecycle-policies/secret",
+            headers=_auth(token_a),
+        )
+        assert resp_a.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # meta
 # ---------------------------------------------------------------------------
 
@@ -544,6 +740,10 @@ class TestRouteTableContract:
             "/v1/datasets/{dataset_uuid}/indexes/{index_name}",
             "/v1/datasets/{dataset_uuid}/indexes/{index_name}/optimize",
             "/v1/datasets/{dataset_uuid}/indexes/{index_name}/merge",
+            "/v1/datasets/{dataset_uuid}/lifecycle-policies",
+            "/v1/datasets/{dataset_uuid}/lifecycle-policies/{policy_name}",
+            "/v1/datasets/{dataset_uuid}/lifecycle-policies/{policy_name}/enable",
+            "/v1/datasets/{dataset_uuid}/lifecycle-policies/{policy_name}/disable",
             "/v1/meta/sync",
             "/v1/meta/sync/{run_id}",
             "/v1/meta/datasets/{dataset_id}/snapshot",

@@ -160,7 +160,7 @@ async def rest_app(configured_settings: None, patch_jwks: None) -> AsyncIterator
     from fastapi import FastAPI
 
     from lcp.api.rest.auth import OIDCAuthMiddleware
-    from lcp.api.rest.routers import datasets, indexes, meta, tasks
+    from lcp.api.rest.routers import datasets, indexes, lifecycle, meta, tasks
     from lcp.db.models import Base
     from lcp.db.rls import install_rls_listener
     from lcp.db.session import get_engine
@@ -179,6 +179,7 @@ async def rest_app(configured_settings: None, patch_jwks: None) -> AsyncIterator
     app.include_router(datasets.router)
     app.include_router(tasks.router)
     app.include_router(indexes.router)
+    app.include_router(lifecycle.router)
     app.include_router(meta.router)
 
     @app.get("/healthz")

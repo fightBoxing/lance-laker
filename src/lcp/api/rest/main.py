@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from lcp import __version__
 from lcp.api.rest.auth import OIDCAuthMiddleware
-from lcp.api.rest.routers import datasets, indexes, meta, tasks
+from lcp.api.rest.routers import datasets, indexes, lifecycle, meta, tasks
 from lcp.core.config import get_settings
 from lcp.db.rls import install_rls_listener
 from lcp.db.session import get_engine
@@ -51,6 +51,7 @@ def create_app() -> FastAPI:
     app.include_router(datasets.router)
     app.include_router(tasks.router)
     app.include_router(indexes.router)
+    app.include_router(lifecycle.router)
     app.include_router(meta.router)
 
     @app.get("/healthz", include_in_schema=False)

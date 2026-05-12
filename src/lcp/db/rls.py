@@ -38,14 +38,15 @@ from lcp.core.tenant import get_current_tenant
 RLS_PROTECTED_TABLES: set[str] = {
     "dataset",
     "task",
-    # NOTE: ``vector_index`` is intentionally NOT here.  The DDL has no
-    # ``tenant_id`` column on it; tenancy is enforced in
-    # :mod:`lcp.services.index_service` by loading the parent ``dataset``
-    # first (which IS RLS-filtered).  Adding a name here would cause the
-    # hook to inject ``vector_index.tenant_id = ...`` and SQL-fail.
+    # NOTE: ``vector_index`` and ``lifecycle_policy`` are intentionally NOT
+    # here.  Their DDL has no ``tenant_id`` column; tenancy is enforced in
+    # the corresponding service modules
+    # (:mod:`lcp.services.index_service`,
+    # :mod:`lcp.services.lifecycle_service`) by loading the parent
+    # ``dataset`` first (which IS RLS-filtered).  Adding a name here would
+    # cause the hook to inject ``<table>.tenant_id = ...`` and SQL-fail.
     "compactions",
     "embedding_jobs",
-    "lifecycle_rules",
 }
 
 

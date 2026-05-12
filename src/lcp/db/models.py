@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     DateTime,
     Integer,
     Numeric,
@@ -198,6 +199,63 @@ class Index(Base):
         return f"<Index dataset={self.dataset_uuid} name={self.index_name} status={self.status}>"
 
 
+class LifecyclePolicy(Base):
+    """Mirror of the ``lifecycle_policy`` table.
+
+    Like :class:`Index`, this table has **no** ``tenant_id`` column: tenancy is
+    enforced via the parent :class:`Dataset` lookup in the service layer
+    (``dataset_service.get_dataset`` is RLS-filtered, so a wrong tenant
+    yields ``DatasetNotFoundError`` and the policy row is never reached).
+
+    Business uniqueness is ``(dataset_uuid, policy_name)`` per DDL
+    ``uk_dataset_policy``; declarative requires the explicit composite
+    ``UniqueConstraint`` to enforce that on inserts (the same lesson learned
+    on :class:`Index`).
+    """
+
+    __tablename__ = "lifecycle_policy"
+    __table_args__ = (
+        # Mirrors DDL ``UNIQUE KEY uk_dataset_policy``.
+        UniqueConstraint(
+            "dataset_uuid", "policy_name", name="uk_dataset_policy",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(_PK_BIGINT, primary_key=True, autoincrement=True)
+    dataset_uuid: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    tier_rules: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # ``ttl_days`` is nullable: NULL means "never delete" (DDL contract).
+    ttl_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    compaction_threshold: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True,
+    )
+    index_optimize_cron: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    # MySQL stores ``enabled`` as TINYINT(1); SQLAlchemy ``Boolean`` maps
+    # cleanly on both MySQL and SQLite, so no ``with_variant`` is needed.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return (
+            f"<LifecyclePolicy dataset={self.dataset_uuid} "
+            f"name={self.policy_name} enabled={self.enabled}>"
+        )
+
+
 # Re-export common SQLAlchemy types so callers can ``from lcp.db.models import``
 # only what they need without pulling in the full SQLAlchemy namespace.
-__all__ = ["Base", "Dataset", "Index", "Task"]
+__all__ = ["Base", "Dataset", "Index", "LifecyclePolicy", "Task"]
