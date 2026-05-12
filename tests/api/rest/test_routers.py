@@ -315,56 +315,165 @@ class TestTasksRouter:
 
 class TestIndexesRouter:
 
-    async def test_list_indexes_accepts_dataset_id_filter(
-        self,
-        http_client: Any,
-        issue_token: Any,
-    ) -> None:
-        token = issue_token(tenant_id="t-idx")
-        resp = await http_client.get(
-            "/v1/indexes?dataset_id=d1",
+    async def _create_dataset(
+        self, http_client: Any, token: str, *, table: str = "t1",
+    ) -> str:
+        """Helper: create a dataset and return its uuid."""
+
+        resp = await http_client.post(
+            "/v1/datasets",
             headers=_auth(token),
+            json={
+                "catalog": "c",
+                "schema": "s",
+                "table": table,
+                "storage_uri": "s3://b/p",
+            },
+        )
+        return resp.json()["dataset_uuid"]
+
+    async def test_list_indexes_empty(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-idx-list")
+        ds_uuid = await self._create_dataset(http_client, token)
+        resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/indexes", headers=_auth(token),
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["filter"]["dataset_id"] == "d1"
+        assert body["items"] == []
+        assert body["total"] == 0
 
-    async def test_create_index_returns_501(
-        self,
-        http_client: Any,
-        issue_token: Any,
+    async def test_list_indexes_unknown_dataset_returns_404(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-idx-404")
+        resp = await http_client.get(
+            "/v1/datasets/no-such-uuid/indexes", headers=_auth(token),
+        )
+        assert resp.status_code == 404
+
+    async def test_create_index_returns_202(
+        self, http_client: Any, issue_token: Any,
     ) -> None:
         token = issue_token(tenant_id="t-idx-create")
+        ds_uuid = await self._create_dataset(http_client, token)
         resp = await http_client.post(
-            "/v1/indexes",
+            f"/v1/datasets/{ds_uuid}/indexes",
             headers=_auth(token),
-            json={"type": "hnsw"},
+            json={
+                "name": "image_vector_hnsw",
+                "column": "image_vector",
+                "type": "HNSW",
+                "params": {"m": 16, "ef_construction": 200},
+            },
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["index_name"] == "image_vector_hnsw"
+        assert body["type"] == "HNSW"
+        assert body["status"] == "BUILDING"
 
-    async def test_optimize_index_returns_501(
-        self,
-        http_client: Any,
-        issue_token: Any,
+    async def test_create_duplicate_index_returns_409(
+        self, http_client: Any, issue_token: Any,
     ) -> None:
+        token = issue_token(tenant_id="t-idx-dup")
+        ds_uuid = await self._create_dataset(http_client, token)
+        payload = {
+            "name": "dup_idx", "column": "vec", "type": "IVF_FLAT",
+        }
+        first = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/indexes",
+            headers=_auth(token), json=payload,
+        )
+        second = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/indexes",
+            headers=_auth(token), json=payload,
+        )
+        assert first.status_code == 202
+        assert second.status_code == 409
+        assert second.json()["detail"]["code"] == "ALREADY_EXISTS"
+
+    async def test_get_index_round_trip(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-idx-get")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/indexes",
+            headers=_auth(token),
+            json={"name": "my_idx", "column": "c", "type": "BTREE"},
+        )
+        resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/indexes/my_idx", headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json()["index_name"] == "my_idx"
+
+    async def test_optimize_building_index_returns_409(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """A freshly-created index is BUILDING; optimize must be rejected."""
+
         token = issue_token(tenant_id="t-idx-opt")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/indexes",
+            headers=_auth(token),
+            json={"name": "opt_idx", "column": "c", "type": "HNSW"},
+        )
         resp = await http_client.post(
-            "/v1/indexes/idx-1/optimize",
+            f"/v1/datasets/{ds_uuid}/indexes/opt_idx/optimize",
             headers=_auth(token),
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["code"] == "INVALID_TRANSITION"
 
-    async def test_drop_index_returns_501(
-        self,
-        http_client: Any,
-        issue_token: Any,
+    async def test_drop_index_returns_204(
+        self, http_client: Any, issue_token: Any,
     ) -> None:
         token = issue_token(tenant_id="t-idx-drop")
-        resp = await http_client.delete(
-            "/v1/indexes/idx-1",
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/indexes",
             headers=_auth(token),
+            json={"name": "drop_idx", "column": "c", "type": "BTREE"},
         )
-        assert resp.status_code == 501
+        resp = await http_client.delete(
+            f"/v1/datasets/{ds_uuid}/indexes/drop_idx", headers=_auth(token),
+        )
+        assert resp.status_code == 204
+        # Verify state moved to DROPPED.
+        get_resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/indexes/drop_idx", headers=_auth(token),
+        )
+        assert get_resp.json()["status"] == "DROPPED"
+
+    async def test_tenant_isolation_via_parent_dataset(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """Tenant B must not see tenant A's index even via direct URL."""
+
+        token_a = issue_token(tenant_id="tenant-a")
+        token_b = issue_token(tenant_id="tenant-b")
+        ds_uuid = await self._create_dataset(http_client, token_a, table="isolated")
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/indexes",
+            headers=_auth(token_a),
+            json={"name": "secret_idx", "column": "c", "type": "HNSW"},
+        )
+        # Tenant B hits the same URL: the parent dataset lookup hits RLS
+        # and 404s before the index is even checked.
+        resp_b = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/indexes/secret_idx", headers=_auth(token_b),
+        )
+        assert resp_b.status_code == 404
+        # Sanity: the owner can still see it.
+        resp_a = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/indexes/secret_idx", headers=_auth(token_a),
+        )
+        assert resp_a.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -431,9 +540,10 @@ class TestRouteTableContract:
             "/v1/tasks/{task_uuid}",
             "/v1/tasks/{task_uuid}/cancel",
             "/v1/tasks/{task_uuid}/retry",
-            "/v1/indexes",
-            "/v1/indexes/{index_id}",
-            "/v1/indexes/{index_id}/optimize",
+            "/v1/datasets/{dataset_uuid}/indexes",
+            "/v1/datasets/{dataset_uuid}/indexes/{index_name}",
+            "/v1/datasets/{dataset_uuid}/indexes/{index_name}/optimize",
+            "/v1/datasets/{dataset_uuid}/indexes/{index_name}/merge",
             "/v1/meta/sync",
             "/v1/meta/sync/{run_id}",
             "/v1/meta/datasets/{dataset_id}/snapshot",

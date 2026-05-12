@@ -22,6 +22,7 @@ from sqlalchemy import (
     Numeric,
     SmallInteger,
     String,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -143,6 +144,60 @@ class Task(Base):
         return f"<Task uuid={self.task_uuid} type={self.task_type} status={self.status}>"
 
 
+class Index(Base):
+    """Mirror of the ``vector_index`` table.
+
+    Unlike :class:`Dataset` and :class:`Task`, this table has **no**
+    ``tenant_id`` column: the DDL deliberately leaves tenancy implicit and
+    relies on the ``dataset_uuid`` foreign key.  The service layer enforces
+    isolation by always loading the parent ``Dataset`` first (which IS RLS-
+    filtered) before touching the index, so a cross-tenant ``dataset_uuid``
+    is rejected at the dataset lookup with 404.
+
+    Business uniqueness is ``(dataset_uuid, index_name)`` (per DDL
+    ``uk_dataset_index_name``); ``id`` is internal only.
+    """
+
+    __tablename__ = "vector_index"
+    __table_args__ = (
+        # Mirrors DDL ``UNIQUE KEY uk_dataset_index_name``; required for
+        # IntegrityError on duplicate insert in both MySQL and sqlite tests.
+        UniqueConstraint("dataset_uuid", "index_name", name="uk_dataset_index_name"),
+    )
+
+    id: Mapped[int] = mapped_column(_PK_BIGINT, primary_key=True, autoincrement=True)
+    dataset_uuid: Mapped[str] = mapped_column(String(64), nullable=False)
+    index_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    column_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    index_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    params: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="BUILDING")
+    coverage: Mapped[Decimal] = mapped_column(
+        Numeric(5, 4), nullable=False, default=Decimal("0.0000"),
+    )
+    fragment_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    delta_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_optimized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True,
+    )
+    last_merged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return f"<Index dataset={self.dataset_uuid} name={self.index_name} status={self.status}>"
+
+
 # Re-export common SQLAlchemy types so callers can ``from lcp.db.models import``
 # only what they need without pulling in the full SQLAlchemy namespace.
-__all__ = ["Base", "Dataset", "Task"]
+__all__ = ["Base", "Dataset", "Index", "Task"]
