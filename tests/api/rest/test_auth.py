@@ -11,7 +11,6 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 
-
 pytestmark = pytest.mark.api
 
 
@@ -88,16 +87,22 @@ class TestContextvarPropagation:
         http_client: Any,
         issue_token: Any,
     ) -> None:
-        """If contextvar did not propagate, the handler would have no tenant."""
+        """If contextvar did not propagate, the handler would have no tenant.
+
+        The list endpoint now performs a real DB query that the RLS hook
+        rewrites with ``WHERE tenant_id = :current_tenant``; reaching the DB
+        at all (status 200) proves the contextvar made it into the handler.
+        """
 
         token = issue_token(tenant_id="acme-corp")
         resp = await http_client.get(
             "/v1/datasets",
             headers={"Authorization": f"Bearer {token}"},
         )
-        # datasets.list_datasets echoes the tenant in the payload.
         assert resp.status_code == 200
-        assert resp.json()["tenant"] == "acme-corp"
+        body = resp.json()
+        assert body["items"] == []
+        assert body["total"] == 0
 
     async def test_different_tenants_isolated(
         self,
@@ -107,16 +112,33 @@ class TestContextvarPropagation:
         token_a = issue_token(tenant_id="tenant-a")
         token_b = issue_token(tenant_id="tenant-b")
 
-        resp_a = await http_client.get(
+        # Tenant A creates one dataset; tenant B must not see it.
+        resp_create = await http_client.post(
             "/v1/datasets",
             headers={"Authorization": f"Bearer {token_a}"},
+            json={
+                "catalog": "c",
+                "schema": "s",
+                "table": "t",
+                "storage_uri": "s3://b/p",
+            },
         )
-        resp_b = await http_client.get(
-            "/v1/datasets",
-            headers={"Authorization": f"Bearer {token_b}"},
-        )
-        assert resp_a.json()["tenant"] == "tenant-a"
-        assert resp_b.json()["tenant"] == "tenant-b"
+        assert resp_create.status_code == 201
+
+        body_b = (
+            await http_client.get(
+                "/v1/datasets",
+                headers={"Authorization": f"Bearer {token_b}"},
+            )
+        ).json()
+        body_a = (
+            await http_client.get(
+                "/v1/datasets",
+                headers={"Authorization": f"Bearer {token_a}"},
+            )
+        ).json()
+        assert body_a["total"] == 1
+        assert body_b["total"] == 0
 
 
 # ---------------------------------------------------------------------------

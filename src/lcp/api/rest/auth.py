@@ -11,7 +11,8 @@ propagation.
 
 from __future__ import annotations
 
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -26,7 +27,6 @@ from lcp.core.tenant import (
     reset_current_tenant,
     set_current_tenant,
 )
-
 
 # OAuth2PasswordBearer is used purely to surface the lock icon in /docs;
 # real flows are Authorization Code or Client Credentials handled by the IdP.

@@ -14,7 +14,6 @@ from lcp.core.tenant import (
     set_current_tenant,
 )
 
-
 pytestmark = pytest.mark.unit
 
 

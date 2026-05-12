@@ -34,6 +34,15 @@ def get_engine() -> AsyncEngine:
     if not settings.db_dsn.startswith("sqlite"):
         kwargs["pool_size"] = settings.db_pool_size
         kwargs["pool_recycle"] = settings.db_pool_recycle_seconds
+    elif ":memory:" in settings.db_dsn:
+        # ``:memory:`` databases are scoped to a single connection, so the
+        # pool MUST keep returning the same one or every checkout will see an
+        # empty schema.  StaticPool guarantees that.  ``check_same_thread`` is
+        # disabled because aiosqlite drives the connection from greenlets.
+        from sqlalchemy.pool import StaticPool
+
+        kwargs["poolclass"] = StaticPool
+        kwargs["connect_args"] = {"check_same_thread": False}
     return create_async_engine(settings.db_dsn, **kwargs)
 
 

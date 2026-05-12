@@ -6,7 +6,6 @@ import pytest
 
 from lcp.core.config import Settings, get_settings
 
-
 pytestmark = pytest.mark.unit
 
 

@@ -29,10 +29,14 @@ from sqlalchemy.sql.selectable import Join
 from lcp.core.config import get_settings
 from lcp.core.tenant import get_current_tenant
 
-
 # Tables that must be filtered by tenant_id; populate as models are added.
+# NOTE: Names must match the actual SQL table names in
+# ``docs/architecture/ddl/lcp_state_schema.sql`` (singular form).  The
+# remaining placeholders (tasks/indexes/compactions/embedding_jobs/
+# lifecycle_rules) are kept for forward-compatibility and will be aligned
+# with the DDL when their corresponding ORM models are introduced.
 RLS_PROTECTED_TABLES: set[str] = {
-    "datasets",
+    "dataset",
     "tasks",
     "indexes",
     "compactions",

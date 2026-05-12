@@ -16,7 +16,6 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-
 # ---------------------------------------------------------------------------
 # Settings + cache reset
 # ---------------------------------------------------------------------------
@@ -162,6 +161,18 @@ async def rest_app(configured_settings: None, patch_jwks: None) -> AsyncIterator
 
     from lcp.api.rest.auth import OIDCAuthMiddleware
     from lcp.api.rest.routers import datasets, indexes, meta, tasks
+    from lcp.db.models import Base
+    from lcp.db.rls import install_rls_listener
+    from lcp.db.session import get_engine
+
+    # Create the ORM schema in the in-memory sqlite DB and install the RLS hook
+    # so the handlers that hit the DB behave like production.  ``rest_app`` is
+    # function-scoped, so the engine cache was already cleared by the
+    # ``_reset_lru_caches`` autouse fixture in this module.
+    engine = get_engine()
+    install_rls_listener(engine.sync_engine)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     app = FastAPI()
     app.add_middleware(OIDCAuthMiddleware)
@@ -175,6 +186,12 @@ async def rest_app(configured_settings: None, patch_jwks: None) -> AsyncIterator
         return {"status": "ok"}
 
     yield app
+    # Drop the in-memory tables and dispose the engine so the next test starts
+    # from a pristine state (the LRU cache reset alone is not enough for
+    # aiosqlite ``StaticPool`` connections).
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()
 
 
 @pytest.fixture

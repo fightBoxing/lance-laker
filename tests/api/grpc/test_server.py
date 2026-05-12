@@ -15,7 +15,6 @@ from unittest.mock import MagicMock
 import grpc
 import pytest
 
-
 pytestmark = pytest.mark.api
 
 

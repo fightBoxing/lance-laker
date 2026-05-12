@@ -24,7 +24,6 @@ from lcp.db.rls import (
     install_rls_listener,
 )
 
-
 pytestmark = pytest.mark.unit
 
 
@@ -37,7 +36,7 @@ pytestmark = pytest.mark.unit
 def tables() -> dict[str, Table]:
     md = MetaData()
     datasets = Table(
-        "datasets",
+        "dataset",
         md,
         Column("id", Integer, primary_key=True),
         Column("tenant_id", String(64)),
@@ -56,7 +55,7 @@ def tables() -> dict[str, Table]:
         Column("id", Integer, primary_key=True),
         Column("message", String(256)),
     )
-    return {"datasets": datasets, "tasks": tasks, "audit": audit}
+    return {"dataset": datasets, "tasks": tasks, "audit": audit}
 
 
 # ---------------------------------------------------------------------------
@@ -67,31 +66,31 @@ def tables() -> dict[str, Table]:
 class TestFindRlsTargets:
 
     def test_finds_single_protected_select(self, tables: dict[str, Table]) -> None:
-        stmt = select(tables["datasets"])
+        stmt = select(tables["dataset"])
         targets = _find_rls_targets(stmt)
         assert len(targets) == 1
-        assert targets[0].name == "datasets"
+        assert targets[0].name == "dataset"
 
     def test_finds_all_protected_targets_in_join(self, tables: dict[str, Table]) -> None:
         """C-1 regression: both RLS tables in the JOIN must be captured."""
 
-        datasets = tables["datasets"]
+        datasets = tables["dataset"]
         tasks = tables["tasks"]
         stmt = select(datasets, tasks).select_from(
             datasets.join(tasks, datasets.c.id == tasks.c.dataset_id),
         )
         targets = _find_rls_targets(stmt)
         names = sorted(t.name for t in targets)
-        assert names == ["datasets", "tasks"]
+        assert names == ["dataset", "tasks"]
 
     def test_ignores_unprotected_tables(self, tables: dict[str, Table]) -> None:
         stmt = select(tables["audit"])
         assert _find_rls_targets(stmt) == []
 
     def test_detects_update_target(self, tables: dict[str, Table]) -> None:
-        stmt = update(tables["datasets"]).values(name="x")
+        stmt = update(tables["dataset"]).values(name="x")
         targets = _find_rls_targets(stmt)
-        assert [t.name for t in targets] == ["datasets"]
+        assert [t.name for t in targets] == ["dataset"]
 
     def test_detects_delete_target(self, tables: dict[str, Table]) -> None:
         stmt = delete(tables["tasks"])
@@ -107,21 +106,21 @@ class TestFindRlsTargets:
 class TestInjectTenantFilter:
 
     def test_predicate_is_qualified_by_table(self, tables: dict[str, Table]) -> None:
-        """Rendered SQL must be ``datasets.tenant_id = :<bindname>``."""
+        """Rendered SQL must be ``dataset.tenant_id = :<bindname>``."""
 
-        stmt = select(tables["datasets"])
+        stmt = select(tables["dataset"])
         targets = _find_rls_targets(stmt)
         rewritten = _inject_tenant_filter(stmt, targets, "acme")
 
         sql = str(rewritten.compile(compile_kwargs={"literal_binds": True}))
         # The qualification prefix is the evidence that C-1 is fixed.
-        assert "datasets.tenant_id" in sql
+        assert "dataset.tenant_id" in sql
         assert "'acme'" in sql
 
     def test_join_gets_both_predicates(self, tables: dict[str, Table]) -> None:
         """Both RLS tables must receive their own qualified predicate."""
 
-        datasets = tables["datasets"]
+        datasets = tables["dataset"]
         tasks = tables["tasks"]
         stmt = select(datasets, tasks).select_from(
             datasets.join(tasks, datasets.c.id == tasks.c.dataset_id),
@@ -130,17 +129,17 @@ class TestInjectTenantFilter:
         rewritten = _inject_tenant_filter(stmt, targets, "acme")
 
         sql = str(rewritten.compile(compile_kwargs={"literal_binds": True}))
-        assert "datasets.tenant_id" in sql
+        assert "dataset.tenant_id" in sql
         assert "tasks.tenant_id" in sql
         # Must not produce a bare, ambiguous predicate.
         assert " tenant_id = " not in sql
 
     def test_injects_on_update(self, tables: dict[str, Table]) -> None:
-        stmt = update(tables["datasets"]).values(name="x")
+        stmt = update(tables["dataset"]).values(name="x")
         targets = _find_rls_targets(stmt)
         rewritten = _inject_tenant_filter(stmt, targets, "acme")
         sql = str(rewritten.compile(compile_kwargs={"literal_binds": True}))
-        assert "datasets.tenant_id" in sql
+        assert "dataset.tenant_id" in sql
 
 
 # ---------------------------------------------------------------------------
@@ -151,7 +150,7 @@ class TestInjectTenantFilter:
 class TestBeforeExecuteHook:
 
     def test_fails_closed_without_principal(self, tables: dict[str, Table]) -> None:
-        stmt = select(tables["datasets"])
+        stmt = select(tables["dataset"])
         with pytest.raises(PermissionError, match="without an authenticated tenant"):
             _before_execute(None, stmt, None, None, {})
 
@@ -179,7 +178,7 @@ class TestBeforeExecuteHook:
         from lcp.core.config import get_settings
         get_settings.cache_clear()
         try:
-            stmt = select(tables["datasets"])
+            stmt = select(tables["dataset"])
             out_stmt, _, _ = _before_execute(None, stmt, None, None, {})
             assert out_stmt is stmt
         finally:
@@ -190,10 +189,10 @@ class TestBeforeExecuteHook:
             TenantPrincipal(tenant_id="acme", subject="u", auth_method="oidc"),
         )
         try:
-            stmt = select(tables["datasets"])
+            stmt = select(tables["dataset"])
             out_stmt, _, _ = _before_execute(None, stmt, None, None, {})
             sql = str(out_stmt.compile(compile_kwargs={"literal_binds": True}))
-            assert "datasets.tenant_id" in sql
+            assert "dataset.tenant_id" in sql
             assert "'acme'" in sql
         finally:
             reset_current_tenant(token)
@@ -220,4 +219,4 @@ class TestProtectedRegistry:
         assert len(RLS_PROTECTED_TABLES) >= 1
 
     def test_registry_contains_datasets(self) -> None:
-        assert "datasets" in RLS_PROTECTED_TABLES
+        assert "dataset" in RLS_PROTECTED_TABLES

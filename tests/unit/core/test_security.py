@@ -23,7 +23,6 @@ from lcp.core.security import (
     validate_oidc_jwt,
 )
 
-
 pytestmark = pytest.mark.unit
 
 
