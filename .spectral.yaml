@@ -1,0 +1,50 @@
+extends:
+  - ["spectral:oas", "all"]
+
+# Spectral rules for the LCP OpenAPI bundles.
+# Scope: docs/architecture/api/openapi/*.yaml
+rules:
+  # --- Project conventions ---------------------------------------------------
+  operation-operationId: error
+  operation-operationId-unique: error
+  operation-tag-defined: error
+  operation-tags: error
+  operation-success-response: error
+
+  # Every operation must declare at least one 4xx response.
+  operation-4xx-response:
+    description: "Every operation must document at least one 4xx response."
+    severity: error
+    given: "$.paths[*][get,put,post,delete,patch]"
+    then:
+      field: "responses"
+      function: schema
+      functionOptions:
+        schema:
+          type: object
+          patternProperties:
+            "^4[0-9][0-9]$": {}
+          minProperties: 1
+
+  # Components must be reused; ad-hoc inline schemas in 2xx bodies are flagged.
+  no-inline-2xx-schema:
+    description: "2xx response bodies must reference a named component schema."
+    severity: warn
+    given: "$.paths[*][*].responses[?(@property.match(/^2[0-9][0-9]$/))].content[*].schema"
+    then:
+      function: truthy
+      field: "$ref"
+
+  # Tag descriptions help client SDKs.
+  tags-must-have-description:
+    description: "Every tag declared at root level must include a description."
+    severity: warn
+    given: "$.tags[*]"
+    then:
+      field: description
+      function: truthy
+
+  # Disable defaults that conflict with our style:
+  oas3-unused-component: warn
+  info-contact: off
+  info-license: off

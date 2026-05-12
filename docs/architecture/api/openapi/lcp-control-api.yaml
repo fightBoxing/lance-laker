@@ -1,0 +1,246 @@
+openapi: 3.0.3
+info:
+  title: LCP Control API
+  description: |
+    Lance Control Plane (LCP) outward control API.
+    Provides dataset/table registration, vectorization configuration,
+    and lifecycle binding endpoints for upstream applications.
+  version: 1.0.0
+  contact:
+    name: LCP Team
+servers:
+  - url: https://lcp.example.com/api/v1
+    description: Production
+  - url: http://localhost:8080/api/v1
+    description: Local development
+
+tags:
+  - name: dataset
+    description: Dataset registration and configuration
+  - name: vectorization
+    description: Vectorization rule binding
+
+paths:
+  /datasets:
+    post:
+      tags: [dataset]
+      summary: Register a new dataset (Lance table) into LCP management
+      operationId: registerDataset
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetRegisterRequest'
+      responses:
+        '201':
+          description: Dataset registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    get:
+      tags: [dataset]
+      summary: List datasets under LCP management
+      operationId: listDatasets
+      parameters:
+        - name: catalog
+          in: query
+          schema: { type: string }
+        - name: schema
+          in: query
+          schema: { type: string }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, maximum: 200 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetListResponse'
+
+  /datasets/{dataset_uuid}:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+    get:
+      tags: [dataset]
+      summary: Get dataset detail
+      operationId: getDataset
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [dataset]
+      summary: Unregister a dataset from LCP management
+      operationId: unregisterDataset
+      responses:
+        '204':
+          description: Unregistered
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasets/{dataset_uuid}/vectorization:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+    put:
+      tags: [vectorization]
+      summary: Bind or update vectorization rule for a dataset
+      operationId: bindVectorizationRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VectorizationRule'
+      responses:
+        '200':
+          description: Rule bound
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VectorizationRule'
+
+    get:
+      tags: [vectorization]
+      summary: Get current vectorization rule
+      operationId: getVectorizationRule
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VectorizationRule'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    DatasetUuid:
+      name: dataset_uuid
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Invalid request payload
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Resource already exists
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, example: INVALID_ARGUMENT }
+        message: { type: string }
+        request_id: { type: string }
+
+    DatasetRegisterRequest:
+      type: object
+      required: [catalog, schema, table, storage_uri]
+      properties:
+        catalog:
+          type: string
+          description: Gravitino catalog name
+          example: lance_catalog
+        schema:
+          type: string
+          example: media
+        table:
+          type: string
+          example: image_embeddings
+        storage_uri:
+          type: string
+          description: Object storage URI of the Lance dataset
+          example: s3://lance-bucket/media/image_embeddings
+        owner:
+          type: string
+          example: alice
+        tenant_id:
+          type: string
+          example: tenant-001
+        description:
+          type: string
+
+    DatasetResponse:
+      allOf:
+        - $ref: '#/components/schemas/DatasetRegisterRequest'
+        - type: object
+          required: [dataset_uuid, status, created_at]
+          properties:
+            dataset_uuid: { type: string, format: uuid }
+            status:
+              type: string
+              enum: [ACTIVE, PAUSED, ARCHIVED, DELETED]
+            row_count: { type: integer, format: int64 }
+            fragment_count: { type: integer }
+            index_coverage: { type: number, format: float }
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    DatasetListResponse:
+      type: object
+      properties:
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/DatasetResponse' }
+
+    VectorizationRule:
+      type: object
+      required: [source_columns, target_column, model]
+      properties:
+        source_columns:
+          type: array
+          items: { type: string }
+          example: [image_url]
+        target_column:
+          type: string
+          example: image_vector
+        model:
+          type: object
+          required: [name, version]
+          properties:
+            name: { type: string, example: clip-vit-base }
+            version: { type: string, example: v1 }
+            endpoint: { type: string, example: http://model-server/v1/embed }
+        batch_size: { type: integer, default: 64 }
+        trigger:
+          type: string
+          enum: [ON_INSERT, SCHEDULED, MANUAL]
+          default: ON_INSERT
+        cron:
+          type: string
+          description: Cron expression when trigger=SCHEDULED

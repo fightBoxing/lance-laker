@@ -1,0 +1,74 @@
+// Embedding service gRPC contract.
+// Embedding workers convert raw multimodal payloads (text / image / audio)
+// into float vectors using a configured model.
+syntax = "proto3";
+
+package lcp.embedding.v1;
+
+option go_package = "lcp/api/embedding/v1;embeddingv1";
+option java_package = "com.lcp.api.embedding.v1";
+
+// ----------------------------------------------------------------------------
+// Modality payload
+// ----------------------------------------------------------------------------
+
+enum Modality {
+  MODALITY_UNSPECIFIED = 0;
+  MODALITY_TEXT        = 1;
+  MODALITY_IMAGE       = 2;
+  MODALITY_AUDIO       = 3;
+  MODALITY_VIDEO       = 4;
+}
+
+message EmbedItem {
+  // Caller-supplied id, returned as-is for correlation.
+  string id = 1;
+  Modality modality = 2;
+  oneof payload {
+    string text = 3;
+    // Inline binary, used for small payloads (< 1 MB recommended).
+    bytes binary = 4;
+    // Object storage URI, used for large payloads.
+    string uri = 5;
+  }
+  // Optional preprocessing hints (e.g. image resize target).
+  map<string, string> hints = 6;
+}
+
+message EmbedVector {
+  string id = 1;
+  repeated float values = 2 [packed = true];
+  // Filled when the upstream item failed (e.g. download error, decode error).
+  string error_code = 3;
+  string error_message = 4;
+}
+
+// ----------------------------------------------------------------------------
+// Embed API
+// ----------------------------------------------------------------------------
+
+message EmbedRequest {
+  string model_name = 1;
+  string model_version = 2;
+  // Optional override of the default endpoint for routing tests.
+  string endpoint = 3;
+  repeated EmbedItem items = 4;
+}
+
+message EmbedResponse {
+  repeated EmbedVector vectors = 1;
+  int32 succeeded = 2;
+  int32 failed = 3;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+service EmbeddingService {
+  // Synchronous batch embedding.
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+
+  // Streaming variant for large jobs.
+  rpc EmbedStream(stream EmbedRequest) returns (stream EmbedResponse);
+}

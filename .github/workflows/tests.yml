@@ -1,0 +1,89 @@
+name: Tests (pytest + coverage)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/tests.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/tests.yml"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# Cancel any in-progress run for the same ref so PRs do not pile up CI minutes.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          # Pin to the same uv major version we use locally for reproducibility.
+          version: "0.4.x"
+          # Cache the uv download cache between runs (keyed on uv.lock).
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies from uv.lock (frozen)
+        # --frozen guarantees we install exactly what uv.lock pins; if the lock
+        # is out of date this step fails fast instead of silently re-resolving.
+        run: uv sync --frozen --extra dev --python ${{ matrix.python-version }}
+
+      - name: Show resolved environment
+        run: |
+          uv run python --version
+          uv run python -m pip list | grep -E "fastapi|grpcio|sqlalchemy|pydantic|pytest" || true
+
+      - name: Run pytest with coverage
+        run: |
+          uv run pytest \
+            --cov \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage.xml \
+            --cov-report=html:htmlcov \
+            --junitxml=pytest-report.xml
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            htmlcov/
+            pytest-report.xml
+          retention-days: 14
+
+      - name: Publish coverage summary to PR
+        if: matrix.python-version == '3.12' && github.event_name == 'pull_request'
+        uses: orgoro/coverage@v3.2
+        with:
+          coverageFile: coverage.xml
+          token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true

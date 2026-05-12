@@ -1,0 +1,223 @@
+openapi: 3.0.3
+info:
+  title: LCP Task API
+  description: |
+    Task lifecycle management API.
+    Covers vectorization, compaction, indexing and lifecycle tasks
+    submitted, queried and controlled by operators or schedulers.
+  version: 1.0.0
+servers:
+  - url: https://lcp.example.com/api/v1
+
+tags:
+  - name: task
+    description: Generic task control plane
+
+paths:
+  /tasks:
+    post:
+      tags: [task]
+      summary: Submit a new task
+      operationId: submitTask
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskSubmitRequest'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+    get:
+      tags: [task]
+      summary: List tasks with filters
+      operationId: listTasks
+      parameters:
+        - name: dataset_uuid
+          in: query
+          schema: { type: string, format: uuid }
+        - name: type
+          in: query
+          schema: { $ref: '#/components/schemas/TaskType' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TaskStatus' }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, maximum: 200 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskListResponse' }
+
+  /tasks/{task_uuid}:
+    parameters:
+      - name: task_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [task]
+      summary: Get task detail
+      operationId: getTask
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /tasks/{task_uuid}:cancel:
+    parameters:
+      - name: task_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [task]
+      summary: Cancel a running or pending task
+      operationId: cancelTask
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '409':
+          description: Task is in terminal state and cannot be cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /tasks/{task_uuid}:retry:
+    parameters:
+      - name: task_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [task]
+      summary: Retry a failed task
+      operationId: retryTask
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+
+components:
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        code: { type: string }
+        message: { type: string }
+        request_id: { type: string }
+
+    TaskType:
+      type: string
+      enum:
+        - VECTORIZE
+        - COMPACTION
+        - INDEX_BUILD
+        - INDEX_OPTIMIZE
+        - INDEX_CLEANUP
+        - LIFECYCLE_RECYCLE
+
+    TaskStatus:
+      type: string
+      enum:
+        - PENDING
+        - QUEUED
+        - RUNNING
+        - SUCCEEDED
+        - FAILED
+        - CANCELLED
+
+    TaskSubmitRequest:
+      type: object
+      required: [type, dataset_uuid]
+      properties:
+        type: { $ref: '#/components/schemas/TaskType' }
+        dataset_uuid: { type: string, format: uuid }
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 9
+          default: 5
+        params:
+          type: object
+          description: Type-specific parameters (free-form JSON)
+          additionalProperties: true
+          example:
+            target_fragment_size_mb: 512
+            max_concurrent: 4
+        idempotency_key:
+          type: string
+          description: Client-supplied key to deduplicate submissions
+
+    Task:
+      type: object
+      required: [task_uuid, type, status, dataset_uuid, created_at]
+      properties:
+        task_uuid: { type: string, format: uuid }
+        type: { $ref: '#/components/schemas/TaskType' }
+        status: { $ref: '#/components/schemas/TaskStatus' }
+        dataset_uuid: { type: string, format: uuid }
+        priority: { type: integer }
+        progress:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+        attempt: { type: integer }
+        max_attempts: { type: integer }
+        worker_id: { type: string }
+        params:
+          type: object
+          additionalProperties: true
+        result:
+          type: object
+          additionalProperties: true
+        error_message: { type: string }
+        scheduled_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    TaskListResponse:
+      type: object
+      properties:
+        total: { type: integer }
+        page: { type: integer }
+        page_size: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }

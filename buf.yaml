@@ -1,0 +1,16 @@
+version: v2
+
+modules:
+  - path: docs/architecture/api/protobuf
+
+lint:
+  use:
+    - STANDARD
+  except:
+    # Allow our existing snake_case file names without the package suffix.
+    - PACKAGE_DIRECTORY_MATCH
+
+breaking:
+  use:
+    - FILE
+  ignore_unstable_packages: true

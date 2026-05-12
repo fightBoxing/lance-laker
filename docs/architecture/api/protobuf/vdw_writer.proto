@@ -1,0 +1,78 @@
+// VDW (Vector Data Writer) gRPC contract.
+// VDW workers receive batched (row + vector) data from Embedding workers
+// or upstream pipelines, then write into Lance dataset via LanceDB SDK.
+syntax = "proto3";
+
+package lcp.vdw.v1;
+
+option go_package = "lcp/api/vdw/v1;vdwv1";
+option java_package = "com.lcp.api.vdw.v1";
+
+import "google/protobuf/timestamp.proto";
+
+// ----------------------------------------------------------------------------
+// Data types
+// ----------------------------------------------------------------------------
+
+// One logical row to be written into Lance.
+// Scalar fields are carried as JSON bytes to keep the schema flexible.
+// Vector fields are carried explicitly for efficient encoding.
+message LanceRow {
+  bytes scalar_fields_json = 1;
+  map<string, FloatVector> vectors = 2;
+}
+
+message FloatVector {
+  repeated float values = 1 [packed = true];
+}
+
+// ----------------------------------------------------------------------------
+// Write API
+// ----------------------------------------------------------------------------
+
+enum WriteMode {
+  WRITE_MODE_UNSPECIFIED = 0;
+  WRITE_MODE_APPEND      = 1;
+  WRITE_MODE_OVERWRITE   = 2;
+  WRITE_MODE_MERGE       = 3; // upsert by primary key
+}
+
+message WriteBatchRequest {
+  string task_uuid = 1;
+  string dataset_uuid = 2;
+  WriteMode mode = 3;
+  // Primary key column name, required when mode = MERGE.
+  string primary_key = 4;
+  repeated LanceRow rows = 5;
+  // Optional client-side checksum to detect duplicate batches.
+  string batch_checksum = 6;
+}
+
+message WriteBatchResponse {
+  int64 written_rows = 1;
+  int64 dataset_version = 2;     // Lance manifest version after write
+  repeated string fragment_uris = 3;
+  google.protobuf.Timestamp committed_at = 4;
+}
+
+message FlushRequest {
+  string task_uuid = 1;
+  string dataset_uuid = 2;
+}
+
+message FlushResponse {
+  int64 dataset_version = 1;
+  bool committed = 2;
+}
+
+// ----------------------------------------------------------------------------
+// Service
+// ----------------------------------------------------------------------------
+
+service VdwService {
+  // Streaming write: upstream pushes batches, VDW responds per batch.
+  rpc WriteBatch(stream WriteBatchRequest) returns (stream WriteBatchResponse);
+
+  // Force-commit any buffered data and bump dataset version.
+  rpc Flush(FlushRequest) returns (FlushResponse);
+}

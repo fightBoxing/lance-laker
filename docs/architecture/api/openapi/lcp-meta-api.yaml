@@ -1,0 +1,170 @@
+openapi: 3.0.3
+info:
+  title: LCP Meta & Monitor API
+  description: |
+    Metadata sync, health and metrics endpoints exposed by LCP.
+    Used by Gravitino sync workers, ops dashboards and Prometheus scrapers.
+  version: 1.0.0
+servers:
+  - url: https://lcp.example.com/api/v1
+
+tags:
+  - name: meta
+    description: Metadata sync between LCP and Gravitino
+  - name: monitor
+    description: Health and metrics
+
+paths:
+  /meta/sync:
+    post:
+      tags: [meta]
+      summary: Trigger an on-demand metadata sync between LCP and Gravitino
+      operationId: triggerMetaSync
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MetaSyncRequest'
+      responses:
+        '202':
+          description: Sync task accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetaSyncResponse' }
+
+  /meta/sync/{sync_id}:
+    parameters:
+      - name: sync_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [meta]
+      summary: Get meta sync status
+      operationId: getMetaSyncStatus
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetaSyncResponse' }
+
+  /datasets/{dataset_uuid}/stats:
+    parameters:
+      - name: dataset_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [monitor]
+      summary: Get dataset health and statistics
+      operationId: getDatasetStats
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DatasetStats' }
+
+  /healthz:
+    get:
+      tags: [monitor]
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      tags: [monitor]
+      summary: Readiness probe (DB / Gravitino / Ray reachable)
+      operationId: readyz
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessReport' }
+        '503':
+          description: Not ready
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessReport' }
+
+  /metrics:
+    get:
+      tags: [monitor]
+      summary: Prometheus metrics endpoint
+      operationId: metrics
+      responses:
+        '200':
+          description: Prometheus exposition format
+          content:
+            text/plain:
+              schema: { type: string }
+
+components:
+  schemas:
+    MetaSyncRequest:
+      type: object
+      properties:
+        scope:
+          type: string
+          enum: [ALL, CATALOG, SCHEMA, DATASET]
+          default: ALL
+        catalog: { type: string }
+        schema: { type: string }
+        dataset_uuid: { type: string, format: uuid }
+
+    MetaSyncResponse:
+      type: object
+      properties:
+        sync_id: { type: string }
+        status:
+          type: string
+          enum: [PENDING, RUNNING, SUCCEEDED, FAILED]
+        scanned: { type: integer }
+        updated: { type: integer }
+        skipped: { type: integer }
+        error_message: { type: string }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+
+    DatasetStats:
+      type: object
+      properties:
+        dataset_uuid: { type: string, format: uuid }
+        row_count: { type: integer, format: int64 }
+        fragment_count: { type: integer }
+        small_fragment_count:
+          type: integer
+          description: Fragments smaller than the compaction threshold
+        avg_fragment_size_mb: { type: number, format: float }
+        index_coverage: { type: number, format: float }
+        last_compaction_at: { type: string, format: date-time }
+        last_index_optimize_at: { type: string, format: date-time }
+        storage_size_bytes: { type: integer, format: int64 }
+
+    ReadinessReport:
+      type: object
+      properties:
+        ready: { type: boolean }
+        components:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              ok: { type: boolean }
+              message: { type: string }
+          example:
+            mysql: { ok: true }
+            gravitino: { ok: true }
+            ray: { ok: false, message: "ray head not reachable" }

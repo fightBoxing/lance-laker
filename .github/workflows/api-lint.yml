@@ -1,0 +1,75 @@
+name: API Lint (OpenAPI + Protobuf)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/architecture/api/**"
+      - ".spectral.yaml"
+      - "buf.yaml"
+      - ".github/workflows/api-lint.yml"
+  pull_request:
+    paths:
+      - "docs/architecture/api/**"
+      - ".spectral.yaml"
+      - "buf.yaml"
+      - ".github/workflows/api-lint.yml"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  spectral:
+    name: Spectral - OpenAPI lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Spectral CLI
+        run: npm install --global @stoplight/spectral-cli@6
+
+      - name: Run Spectral against OpenAPI bundles
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(docs/architecture/api/openapi/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No OpenAPI files found; nothing to lint."
+            exit 0
+          fi
+          for f in "${files[@]}"; do
+            echo "::group::Spectral $f"
+            spectral lint --ruleset .spectral.yaml --fail-severity=error "$f"
+            echo "::endgroup::"
+          done
+
+  buf:
+    name: Buf - Protobuf lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Buf
+        uses: bufbuild/buf-setup-action@v1
+        with:
+          version: "1.34.0"
+
+      - name: Buf lint
+        uses: bufbuild/buf-lint-action@v1
+        with:
+          input: "docs/architecture/api/protobuf"
+
+      - name: Buf breaking-change check (vs main)
+        if: github.event_name == 'pull_request'
+        uses: bufbuild/buf-breaking-action@v1
+        with:
+          input: "docs/architecture/api/protobuf"
+          against: "https://github.com/${{ github.repository }}.git#branch=${{ github.event.pull_request.base.ref }},subdir=docs/architecture/api/protobuf"

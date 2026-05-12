@@ -1,0 +1,133 @@
+// LCP <-> Worker bidirectional gRPC contract.
+// Used by all worker types (VDW, Embedding, Compaction, Indexing) to:
+//   1. Pull tasks from LCP scheduler
+//   2. Stream progress / heartbeats back to LCP
+//   3. Report final results
+syntax = "proto3";
+
+package lcp.worker.v1;
+
+option go_package = "lcp/api/worker/v1;workerv1";
+option java_package = "com.lcp.api.worker.v1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+// ----------------------------------------------------------------------------
+// Common types
+// ----------------------------------------------------------------------------
+
+enum TaskType {
+  TASK_TYPE_UNSPECIFIED   = 0;
+  TASK_TYPE_VECTORIZE     = 1;
+  TASK_TYPE_COMPACTION    = 2;
+  TASK_TYPE_INDEX_BUILD   = 3;
+  TASK_TYPE_INDEX_OPTIMIZE = 4;
+  TASK_TYPE_INDEX_CLEANUP = 5;
+  TASK_TYPE_LIFECYCLE_RECYCLE = 6;
+}
+
+enum TaskStatus {
+  TASK_STATUS_UNSPECIFIED = 0;
+  TASK_STATUS_PENDING     = 1;
+  TASK_STATUS_QUEUED      = 2;
+  TASK_STATUS_RUNNING     = 3;
+  TASK_STATUS_SUCCEEDED   = 4;
+  TASK_STATUS_FAILED      = 5;
+  TASK_STATUS_CANCELLED   = 6;
+}
+
+message Task {
+  string task_uuid = 1;
+  TaskType type = 2;
+  TaskStatus status = 3;
+  string dataset_uuid = 4;
+  int32 priority = 5;
+  int32 attempt = 6;
+  int32 max_attempts = 7;
+  // Task-specific parameters as JSON-like struct.
+  google.protobuf.Struct params = 8;
+  google.protobuf.Timestamp scheduled_at = 9;
+}
+
+// ----------------------------------------------------------------------------
+// Worker -> LCP: lifecycle messages
+// ----------------------------------------------------------------------------
+
+message RegisterRequest {
+  string worker_id = 1;
+  string worker_type = 2;          // e.g. "vdw", "embedding"
+  string host = 3;
+  int32 capacity = 4;              // max concurrent tasks
+  map<string, string> labels = 5;  // for routing / affinity
+}
+
+message RegisterResponse {
+  string lease_id = 1;
+  int32 heartbeat_interval_seconds = 2;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  string lease_id = 2;
+  int32 in_flight = 3;
+  repeated string running_task_uuids = 4;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+  bool should_drain = 2;          // LCP asks worker to gracefully stop pulling
+}
+
+message PollTaskRequest {
+  string worker_id = 1;
+  repeated TaskType accept_types = 2;
+  int32 max_batch = 3;
+}
+
+message PollTaskResponse {
+  repeated Task tasks = 1;
+}
+
+message TaskProgress {
+  string task_uuid = 1;
+  string worker_id = 2;
+  TaskStatus status = 3;
+  float progress = 4;             // 0.0 ~ 1.0
+  string message = 5;
+  google.protobuf.Timestamp ts = 6;
+}
+
+message ReportResultRequest {
+  string task_uuid = 1;
+  string worker_id = 2;
+  TaskStatus terminal_status = 3; // SUCCEEDED / FAILED / CANCELLED
+  google.protobuf.Struct result = 4;
+  string error_code = 5;
+  string error_message = 6;
+}
+
+message ReportResultResponse {
+  bool acknowledged = 1;
+}
+
+// ----------------------------------------------------------------------------
+// Service definitions
+// ----------------------------------------------------------------------------
+
+service WorkerService {
+  // Worker registers itself with LCP scheduler on startup.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Periodic heartbeat. Bidirectional stream so LCP can push drain signal.
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+  // Pull next batch of tasks. Long-poll style.
+  rpc PollTask(PollTaskRequest) returns (PollTaskResponse);
+
+  // Stream progress updates while running.
+  rpc StreamProgress(stream TaskProgress) returns (stream TaskProgress);
+
+  // Submit terminal result.
+  rpc ReportResult(ReportResultRequest) returns (ReportResultResponse);
+}

@@ -1,0 +1,183 @@
+openapi: 3.0.3
+info:
+  title: LCP Index API
+  description: |
+    Vector index lifecycle API.
+    Manages create / optimize / merge / drop operations and exposes
+    index metadata, coverage and health metrics.
+  version: 1.0.0
+servers:
+  - url: https://lcp.example.com/api/v1
+
+tags:
+  - name: index
+    description: Vector index management
+
+paths:
+  /datasets/{dataset_uuid}/indexes:
+    parameters:
+      - name: dataset_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [index]
+      summary: Create a new vector index
+      operationId: createIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IndexCreateRequest'
+      responses:
+        '202':
+          description: Index build task accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IndexResponse' }
+
+    get:
+      tags: [index]
+      summary: List indexes of a dataset
+      operationId: listIndexes
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/IndexResponse' }
+
+  /datasets/{dataset_uuid}/indexes/{index_name}:
+    parameters:
+      - name: dataset_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: index_name
+        in: path
+        required: true
+        schema: { type: string }
+
+    get:
+      tags: [index]
+      summary: Get index detail (params, coverage, status)
+      operationId: getIndex
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IndexResponse' }
+
+    delete:
+      tags: [index]
+      summary: Drop the index
+      operationId: dropIndex
+      responses:
+        '204':
+          description: Dropped
+
+  /datasets/{dataset_uuid}/indexes/{index_name}:optimize:
+    parameters:
+      - name: dataset_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: index_name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [index]
+      summary: Trigger incremental index optimization
+      operationId: optimizeIndex
+      responses:
+        '202':
+          description: Optimize task accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IndexResponse' }
+
+  /datasets/{dataset_uuid}/indexes/{index_name}:merge:
+    parameters:
+      - name: dataset_uuid
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+      - name: index_name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [index]
+      summary: Merge index deltas to reduce fragmentation
+      operationId: mergeIndex
+      responses:
+        '202':
+          description: Merge task accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IndexResponse' }
+
+components:
+  schemas:
+    IndexType:
+      type: string
+      enum: [HNSW, IVF_PQ, IVF_FLAT, BTREE, BITMAP, FTS]
+
+    IndexStatus:
+      type: string
+      enum: [BUILDING, READY, OPTIMIZING, MERGING, FAILED, DROPPED]
+
+    IndexCreateRequest:
+      type: object
+      required: [name, column, type]
+      properties:
+        name:
+          type: string
+          example: image_vector_hnsw
+        column:
+          type: string
+          example: image_vector
+        type:
+          $ref: '#/components/schemas/IndexType'
+        params:
+          type: object
+          description: Type-specific parameters
+          additionalProperties: true
+          example:
+            m: 16
+            ef_construction: 200
+            metric: cosine
+        replace_if_exists:
+          type: boolean
+          default: false
+
+    IndexResponse:
+      type: object
+      properties:
+        index_name: { type: string }
+        dataset_uuid: { type: string, format: uuid }
+        column: { type: string }
+        type: { $ref: '#/components/schemas/IndexType' }
+        status: { $ref: '#/components/schemas/IndexStatus' }
+        params:
+          type: object
+          additionalProperties: true
+        coverage:
+          type: number
+          format: float
+          description: Ratio of indexed rows to total rows
+          minimum: 0
+          maximum: 1
+        fragment_count: { type: integer }
+        delta_count:
+          type: integer
+          description: Unmerged delta count
+        last_optimized_at: { type: string, format: date-time }
+        last_merged_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
