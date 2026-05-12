@@ -15,11 +15,18 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class TenantPrincipal:
-    """Identity and tenant info extracted from the inbound credential."""
+    """Identity and tenant info extracted from the inbound credential.
+
+    The optional ``is_system`` flag is set by
+    :func:`with_system_context` so the RLS hook in :mod:`lcp.db.rls` can
+    detect a scheduler / worker thread and skip the per-tenant filter.
+    Regular request handlers always see ``is_system=False``.
+    """
 
     tenant_id: str
     subject: str
-    auth_method: str  # "oidc" | "mtls"
+    auth_method: str  # "oidc" | "mtls" | "system"
+    is_system: bool = False
 
 
 _current_tenant: ContextVar[TenantPrincipal | None] = ContextVar(
@@ -64,3 +71,51 @@ def require_current_tenant() -> TenantPrincipal:
             "this code path requires an authenticated request context.",
         )
     return principal
+
+
+# ---------------------------------------------------------------------------
+# System principal helpers
+# ---------------------------------------------------------------------------
+
+
+SYSTEM_TENANT_ID = "__system__"
+
+
+def _system_principal(subject: str = "scheduler") -> TenantPrincipal:
+    """Build the canonical system principal used by background processes."""
+
+    return TenantPrincipal(
+        tenant_id=SYSTEM_TENANT_ID,
+        subject=subject,
+        auth_method="system",
+        is_system=True,
+    )
+
+
+class _SystemContext:
+    """Context manager that binds a system principal for the current task.
+
+    Use this around scheduler / reaper code paths that legitimately need to
+    read or write rows belonging to many tenants in one transaction.  The
+    RLS hook detects ``is_system`` and skips its tenant filter, but the
+    code is still expected to preserve each row's ``tenant_id`` on writes.
+    """
+
+    def __init__(self, subject: str = "scheduler") -> None:
+        self._subject = subject
+        self._token: Token[TenantPrincipal | None] | None = None
+
+    def __enter__(self) -> TenantPrincipal:
+        principal = _system_principal(self._subject)
+        self._token = _current_tenant.set(principal)
+        return principal
+
+    def __exit__(self, *exc: object) -> None:
+        if self._token is not None:
+            _current_tenant.reset(self._token)
+
+
+def with_system_context(subject: str = "scheduler") -> _SystemContext:
+    """Convenience factory: ``with with_system_context(): ...``."""
+
+    return _SystemContext(subject)

@@ -146,6 +146,13 @@ def _before_execute(  # noqa: PLR0913 - SQLAlchemy hook signature is fixed
             "tenant context.",
         )
 
+    # System principals (scheduler, reaper, ops tooling) legitimately read
+    # and write rows across tenants; bypass the per-tenant filter for them.
+    # Such code is still expected to preserve each row's ``tenant_id`` when
+    # mutating data — the hook only opts out of the WHERE injection.
+    if getattr(principal, "is_system", False):
+        return clauseelement, multiparams, params
+
     rewritten = _inject_tenant_filter(clauseelement, targets, principal.tenant_id)
     return rewritten, multiparams, params
 

@@ -310,6 +310,52 @@ class VectorizationRule(Base):
         )
 
 
+class WorkerRegistry(Base):
+    """Mirror of the ``worker_registry`` table.
+
+    System-level table (no ``tenant_id``): the scheduler updates this table
+    using a system principal so the RLS hook skips tenant filtering.
+
+    Each row represents an active worker lease.  ``worker_id`` is unique
+    (DDL ``uk_worker_id``); a worker re-registering after a restart UPSERTs
+    on the same row to keep history.
+    """
+
+    __tablename__ = "worker_registry"
+
+    id: Mapped[int] = mapped_column(_PK_BIGINT, primary_key=True, autoincrement=True)
+    worker_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    worker_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    host: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # ``lease_id`` is rotated on every (re)register so that a stale heartbeat
+    # from a worker that lost its lease can be detected and rejected.
+    lease_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    capacity: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    in_flight: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    labels: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="ALIVE",
+    )
+    last_heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now(),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return (
+            f"<WorkerRegistry id={self.worker_id} type={self.worker_type} "
+            f"status={self.status} in_flight={self.in_flight}/{self.capacity}>"
+        )
+
+
 # Re-export common SQLAlchemy types so callers can ``from lcp.db.models import``
 # only what they need without pulling in the full SQLAlchemy namespace.
 __all__ = [
@@ -319,4 +365,5 @@ __all__ = [
     "LifecyclePolicy",
     "Task",
     "VectorizationRule",
+    "WorkerRegistry",
 ]
