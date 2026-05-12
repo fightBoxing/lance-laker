@@ -256,6 +256,67 @@ class LifecyclePolicy(Base):
         )
 
 
+class VectorizationRule(Base):
+    """Mirror of the ``vectorization_rule`` table.
+
+    Like :class:`Index` and :class:`LifecyclePolicy`, this table has **no**
+    ``tenant_id`` column: tenancy is enforced via the parent :class:`Dataset`
+    lookup in :mod:`lcp.services.vectorization_service`.
+
+    Business uniqueness is ``(dataset_uuid, target_column)`` per DDL
+    ``uk_dataset_target``; declarative requires the explicit composite
+    ``UniqueConstraint`` to enforce that on inserts.
+    """
+
+    __tablename__ = "vectorization_rule"
+    __table_args__ = (
+        # Mirrors DDL ``UNIQUE KEY uk_dataset_target``.
+        UniqueConstraint(
+            "dataset_uuid", "target_column", name="uk_dataset_target",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(_PK_BIGINT, primary_key=True, autoincrement=True)
+    dataset_uuid: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_column: Mapped[str] = mapped_column(String(128), nullable=False)
+    # ``source_columns`` is stored as a JSON array per DDL comment.
+    source_columns: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    model_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_endpoint: Mapped[str | None] = mapped_column(
+        String(512), nullable=True,
+    )
+    batch_size: Mapped[int] = mapped_column(Integer, nullable=False, default=64)
+    trigger_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="ON_INSERT",
+    )
+    cron_expr: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    extra: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return (
+            f"<VectorizationRule dataset={self.dataset_uuid} "
+            f"target={self.target_column} model={self.model_name}@{self.model_version}>"
+        )
+
+
 # Re-export common SQLAlchemy types so callers can ``from lcp.db.models import``
 # only what they need without pulling in the full SQLAlchemy namespace.
-__all__ = ["Base", "Dataset", "Index", "LifecyclePolicy", "Task"]
+__all__ = [
+    "Base",
+    "Dataset",
+    "Index",
+    "LifecyclePolicy",
+    "Task",
+    "VectorizationRule",
+]

@@ -673,6 +673,240 @@ class TestLifecycleRouter:
 
 
 # ---------------------------------------------------------------------------
+# vectorization rules
+# ---------------------------------------------------------------------------
+
+
+class TestVectorizationRouter:
+
+    async def _create_dataset(
+        self, http_client: Any, token: str, *, table: str = "t1",
+    ) -> str:
+        """Helper: create a dataset and return its uuid."""
+
+        resp = await http_client.post(
+            "/v1/datasets",
+            headers=_auth(token),
+            json={
+                "catalog": "c",
+                "schema": "s",
+                "table": table,
+                "storage_uri": "s3://b/p",
+            },
+        )
+        return resp.json()["dataset_uuid"]
+
+    async def test_list_rules_empty(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-vec-list")
+        ds_uuid = await self._create_dataset(http_client, token)
+        resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"total": 0, "items": []}
+
+    async def test_create_rule_returns_201(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-vec-create")
+        ds_uuid = await self._create_dataset(http_client, token)
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "image_vector",
+                "source_columns": ["image_url"],
+                "model_name": "clip-vit-large",
+                "model_version": "1.0",
+            },
+        )
+        assert resp.status_code == 201
+        body = resp.json()
+        assert body["target_column"] == "image_vector"
+        assert body["trigger_type"] == "ON_INSERT"
+        assert body["enabled"] is True
+
+    async def test_scheduled_rule_without_cron_returns_422(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """Pydantic must reject SCHEDULED + missing cron at request validation."""
+
+        token = issue_token(tenant_id="t-vec-cron")
+        ds_uuid = await self._create_dataset(http_client, token)
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+                "trigger_type": "SCHEDULED",
+            },
+        )
+        assert resp.status_code == 422
+
+    async def test_create_duplicate_rule_returns_409(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-vec-dup")
+        ds_uuid = await self._create_dataset(http_client, token)
+        payload = {
+            "target_column": "v",
+            "source_columns": ["a"],
+            "model_name": "m",
+            "model_version": "1",
+        }
+        first = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token), json=payload,
+        )
+        second = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token), json=payload,
+        )
+        assert first.status_code == 201
+        assert second.status_code == 409
+        assert second.json()["detail"]["code"] == "ALREADY_EXISTS"
+
+    async def test_get_rule_round_trip(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-vec-get")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a", "b"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        resp = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["source_columns"] == ["a", "b"]
+
+    async def test_patch_promoting_to_scheduled_without_cron_returns_400(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """Service-layer merged-state validation rejects PATCH that breaks invariant."""
+
+        token = issue_token(tenant_id="t-vec-patch-bad")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        # Existing rule is ON_INSERT, no cron; flipping to SCHEDULED alone
+        # would leave it non-runnable -> service must 400.
+        resp = await http_client.patch(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v",
+            headers=_auth(token),
+            json={"trigger_type": "SCHEDULED"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["code"] == "INVALID_ARGUMENT"
+
+    async def test_patch_promoting_to_scheduled_with_cron_returns_200(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-vec-patch-good")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        resp = await http_client.patch(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v",
+            headers=_auth(token),
+            json={"trigger_type": "SCHEDULED", "cron_expr": "0 2 * * *"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trigger_type"] == "SCHEDULED"
+        assert body["cron_expr"] == "0 2 * * *"
+
+    async def test_disable_then_enable_rule(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-vec-toggle")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        disabled = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v/disable",
+            headers=_auth(token),
+        )
+        assert disabled.status_code == 200
+        assert disabled.json()["enabled"] is False
+
+        enabled = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v/enable",
+            headers=_auth(token),
+        )
+        assert enabled.status_code == 200
+        assert enabled.json()["enabled"] is True
+
+    async def test_tenant_isolation_via_parent_dataset(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """Tenant B must not see tenant A's rule via direct URL."""
+
+        token_a = issue_token(tenant_id="tenant-a")
+        token_b = issue_token(tenant_id="tenant-b")
+        ds_uuid = await self._create_dataset(http_client, token_a, table="isolated")
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token_a),
+            json={
+                "target_column": "secret",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        resp_b = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/secret",
+            headers=_auth(token_b),
+        )
+        assert resp_b.status_code == 404
+        resp_a = await http_client.get(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/secret",
+            headers=_auth(token_a),
+        )
+        assert resp_a.status_code == 200
+
+
+# ---------------------------------------------------------------------------
 # meta
 # ---------------------------------------------------------------------------
 
@@ -744,6 +978,10 @@ class TestRouteTableContract:
             "/v1/datasets/{dataset_uuid}/lifecycle-policies/{policy_name}",
             "/v1/datasets/{dataset_uuid}/lifecycle-policies/{policy_name}/enable",
             "/v1/datasets/{dataset_uuid}/lifecycle-policies/{policy_name}/disable",
+            "/v1/datasets/{dataset_uuid}/vectorization-rules",
+            "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}",
+            "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/enable",
+            "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/disable",
             "/v1/meta/sync",
             "/v1/meta/sync/{run_id}",
             "/v1/meta/datasets/{dataset_id}/snapshot",

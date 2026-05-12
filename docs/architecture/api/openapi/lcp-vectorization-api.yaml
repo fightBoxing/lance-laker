@@ -1,0 +1,300 @@
+openapi: 3.0.3
+info:
+  title: LCP Vectorization Rule API
+  description: |
+    Per-dataset vectorization rules.
+
+    A vectorization rule binds a target vector column to one or more
+    source columns and a model.  Each dataset can host multiple rules
+    (uniqueness is per ``(dataset_uuid, target_column)``).
+
+    The rule itself is metadata; the actual embedding work runs in the
+    embedding worker (out of scope for this API), which reads
+    ``trigger_type`` to decide when to act:
+
+    - ``ON_INSERT``  - run for each newly inserted batch
+    - ``SCHEDULED``  - run on the supplied ``cron_expr``
+    - ``MANUAL``     - only run when explicitly invoked
+  version: 1.0.0
+servers:
+  - url: https://lcp.example.com/api/v1
+  - url: http://localhost:8080/api/v1
+
+tags:
+  - name: vectorization
+    description: Per-dataset vectorization rule management
+
+paths:
+  /datasets/{dataset_uuid}/vectorization-rules:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+    post:
+      tags: [vectorization]
+      summary: Create a vectorization rule
+      operationId: createVectorizationRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleCreateRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    get:
+      tags: [vectorization]
+      summary: List vectorization rules for the dataset
+      operationId: listVectorizationRules
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleListResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasets/{dataset_uuid}/vectorization-rules/{target_column}:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+      - $ref: '#/components/parameters/TargetColumn'
+    get:
+      tags: [vectorization]
+      summary: Get rule detail
+      operationId: getVectorizationRule
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [vectorization]
+      summary: Update rule fields
+      operationId: updateVectorizationRule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RuleUpdateRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleResponse' }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [vectorization]
+      summary: Delete a rule
+      operationId: deleteVectorizationRule
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasets/{dataset_uuid}/vectorization-rules/{target_column}/enable:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+      - $ref: '#/components/parameters/TargetColumn'
+    post:
+      tags: [vectorization]
+      summary: Enable the rule
+      operationId: enableVectorizationRule
+      responses:
+        '200':
+          description: Enabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasets/{dataset_uuid}/vectorization-rules/{target_column}/disable:
+    parameters:
+      - $ref: '#/components/parameters/DatasetUuid'
+      - $ref: '#/components/parameters/TargetColumn'
+    post:
+      tags: [vectorization]
+      summary: Disable the rule
+      operationId: disableVectorizationRule
+      responses:
+        '200':
+          description: Disabled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RuleResponse' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    DatasetUuid:
+      name: dataset_uuid
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    TargetColumn:
+      name: target_column
+      in: path
+      required: true
+      schema: { type: string, minLength: 1, maxLength: 128 }
+
+  responses:
+    BadRequest:
+      description: Validation error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Resource already exists
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, example: NOT_FOUND }
+        message: { type: string }
+        request_id: { type: string }
+
+    TriggerType:
+      type: string
+      enum: [ON_INSERT, SCHEDULED, MANUAL]
+
+    RuleCreateRequest:
+      type: object
+      required: [target_column, source_columns, model_name, model_version]
+      properties:
+        target_column:
+          type: string
+          minLength: 1
+          maxLength: 128
+          example: image_vector
+        source_columns:
+          type: array
+          minItems: 1
+          items: { type: string, minLength: 1 }
+          example: ['image_url']
+        model_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          example: clip-vit-large
+        model_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+          example: '1.0'
+        model_endpoint:
+          type: string
+          maxLength: 512
+          nullable: true
+        batch_size:
+          type: integer
+          minimum: 1
+          default: 64
+        trigger_type:
+          $ref: '#/components/schemas/TriggerType'
+        cron_expr:
+          type: string
+          maxLength: 64
+          nullable: true
+          description: Required when trigger_type is SCHEDULED
+        enabled:
+          type: boolean
+          default: true
+        extra:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+    RuleUpdateRequest:
+      type: object
+      description: All fields optional; only the supplied fields are mutated.
+      properties:
+        source_columns:
+          type: array
+          minItems: 1
+          items: { type: string, minLength: 1 }
+        model_name: { type: string, minLength: 1, maxLength: 128 }
+        model_version: { type: string, minLength: 1, maxLength: 64 }
+        model_endpoint: { type: string, maxLength: 512, nullable: true }
+        batch_size: { type: integer, minimum: 1 }
+        trigger_type: { $ref: '#/components/schemas/TriggerType' }
+        cron_expr: { type: string, maxLength: 64, nullable: true }
+        extra:
+          type: object
+          additionalProperties: true
+          nullable: true
+
+    RuleResponse:
+      type: object
+      required:
+        - target_column
+        - dataset_uuid
+        - source_columns
+        - model_name
+        - model_version
+        - batch_size
+        - trigger_type
+        - enabled
+        - created_at
+      properties:
+        target_column: { type: string }
+        dataset_uuid: { type: string, format: uuid }
+        source_columns:
+          type: array
+          items: { type: string }
+        model_name: { type: string }
+        model_version: { type: string }
+        model_endpoint:
+          type: string
+          nullable: true
+        batch_size: { type: integer }
+        trigger_type: { $ref: '#/components/schemas/TriggerType' }
+        cron_expr:
+          type: string
+          nullable: true
+        enabled: { type: boolean }
+        extra:
+          type: object
+          additionalProperties: true
+          nullable: true
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    RuleListResponse:
+      type: object
+      properties:
+        total: { type: integer }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/RuleResponse' }
