@@ -80,7 +80,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
 
-  /tasks/{task_uuid}:cancel:
+  /tasks/{task_uuid}/cancel:
     parameters:
       - name: task_uuid
         in: path
@@ -96,13 +96,15 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
           description: Task is in terminal state and cannot be cancelled
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
-  /tasks/{task_uuid}:retry:
+  /tasks/{task_uuid}/retry:
     parameters:
       - name: task_uuid
         in: path
@@ -118,6 +120,13 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Task' }
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Task is not in a retryable state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
 components:
   responses:

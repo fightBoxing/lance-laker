@@ -37,7 +37,7 @@ from lcp.core.tenant import get_current_tenant
 # with the DDL when their corresponding ORM models are introduced.
 RLS_PROTECTED_TABLES: set[str] = {
     "dataset",
-    "tasks",
+    "task",
     "indexes",
     "compactions",
     "embedding_jobs",

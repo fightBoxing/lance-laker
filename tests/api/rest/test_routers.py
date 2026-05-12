@@ -164,32 +164,148 @@ class TestDatasetsRouter:
 
 class TestTasksRouter:
 
-    async def test_list_tasks_ok(self, http_client: Any, issue_token: Any) -> None:
+    async def test_list_tasks_ok_empty(self, http_client: Any, issue_token: Any) -> None:
         token = issue_token(tenant_id="t-tasks")
         resp = await http_client.get(
-            "/v1/tasks?status_filter=running",
+            "/v1/tasks?status=RUNNING",
             headers=_auth(token),
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["filter"]["status"] == "running"
+        assert body["items"] == []
+        assert body["total"] == 0
+        assert body["page"] == 1
+        assert body["page_size"] == 20
 
-    async def test_submit_task_returns_501(self, http_client: Any, issue_token: Any) -> None:
+    async def test_submit_task_returns_202(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
         token = issue_token(tenant_id="t-sub")
         resp = await http_client.post(
             "/v1/tasks",
             headers=_auth(token),
-            json={"type": "compaction"},
+            json={
+                "type": "COMPACTION",
+                "dataset_uuid": "00000000-0000-0000-0000-000000000001",
+            },
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["type"] == "COMPACTION"
+        assert body["status"] == "PENDING"
+        assert body["tenant_id"] == "t-sub"
+        assert body["priority"] == 5
+        assert "task_uuid" in body
 
-    async def test_cancel_task_returns_501(self, http_client: Any, issue_token: Any) -> None:
-        token = issue_token(tenant_id="t-cancel")
-        resp = await http_client.post(
-            "/v1/tasks/xyz/cancel",
-            headers=_auth(token),
+    async def test_submit_task_idempotency_returns_200_on_replay(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-idem")
+        payload = {
+            "type": "VECTORIZE",
+            "dataset_uuid": "00000000-0000-0000-0000-000000000002",
+            "idempotency_key": "my-key-1",
+        }
+        first = await http_client.post(
+            "/v1/tasks", headers=_auth(token), json=payload,
         )
-        assert resp.status_code == 501
+        second = await http_client.post(
+            "/v1/tasks", headers=_auth(token), json=payload,
+        )
+        assert first.status_code == 202
+        assert second.status_code == 200
+        # Same row returned -> same task_uuid.
+        assert first.json()["task_uuid"] == second.json()["task_uuid"]
+
+    async def test_get_task_round_trip(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-get")
+        created = (
+            await http_client.post(
+                "/v1/tasks",
+                headers=_auth(token),
+                json={
+                    "type": "INDEX_BUILD",
+                    "dataset_uuid": "d-1",
+                },
+            )
+        ).json()
+        uuid_ = created["task_uuid"]
+        resp = await http_client.get(f"/v1/tasks/{uuid_}", headers=_auth(token))
+        assert resp.status_code == 200
+        assert resp.json()["task_uuid"] == uuid_
+
+    async def test_get_unknown_task_returns_404(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-get-missing")
+        resp = await http_client.get("/v1/tasks/no-such-uuid", headers=_auth(token))
+        assert resp.status_code == 404
+
+    async def test_cancel_pending_task_returns_200(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-cancel")
+        created = (
+            await http_client.post(
+                "/v1/tasks",
+                headers=_auth(token),
+                json={"type": "COMPACTION", "dataset_uuid": "d-1"},
+            )
+        ).json()
+        uuid_ = created["task_uuid"]
+        resp = await http_client.post(f"/v1/tasks/{uuid_}/cancel", headers=_auth(token))
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "CANCELLED"
+
+    async def test_retry_non_failed_task_returns_409(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-retry")
+        created = (
+            await http_client.post(
+                "/v1/tasks",
+                headers=_auth(token),
+                json={"type": "COMPACTION", "dataset_uuid": "d-1"},
+            )
+        ).json()
+        uuid_ = created["task_uuid"]
+        # Fresh task is PENDING, retry must be rejected.
+        resp = await http_client.post(f"/v1/tasks/{uuid_}/retry", headers=_auth(token))
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["code"] == "INVALID_TRANSITION"
+
+    async def test_tenant_isolation_on_task_list(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        """RLS regression: tasks from tenant A must be invisible to tenant B."""
+
+        token_a = issue_token(tenant_id="tenant-a")
+        token_b = issue_token(tenant_id="tenant-b")
+        await http_client.post(
+            "/v1/tasks",
+            headers=_auth(token_a),
+            json={"type": "COMPACTION", "dataset_uuid": "d-1"},
+        )
+        body_b = (await http_client.get("/v1/tasks", headers=_auth(token_b))).json()
+        assert body_b["total"] == 0
+        body_a = (await http_client.get("/v1/tasks", headers=_auth(token_a))).json()
+        assert body_a["total"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -312,8 +428,9 @@ class TestRouteTableContract:
             "/v1/datasets",
             "/v1/datasets/{dataset_uuid}",
             "/v1/tasks",
-            "/v1/tasks/{task_id}",
-            "/v1/tasks/{task_id}/cancel",
+            "/v1/tasks/{task_uuid}",
+            "/v1/tasks/{task_uuid}/cancel",
+            "/v1/tasks/{task_uuid}/retry",
             "/v1/indexes",
             "/v1/indexes/{index_id}",
             "/v1/indexes/{index_id}/optimize",

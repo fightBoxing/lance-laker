@@ -43,7 +43,7 @@ def tables() -> dict[str, Table]:
         Column("name", String(128)),
     )
     tasks = Table(
-        "tasks",
+        "task",
         md,
         Column("id", Integer, primary_key=True),
         Column("dataset_id", Integer),
@@ -55,7 +55,7 @@ def tables() -> dict[str, Table]:
         Column("id", Integer, primary_key=True),
         Column("message", String(256)),
     )
-    return {"dataset": datasets, "tasks": tasks, "audit": audit}
+    return {"dataset": datasets, "task": tasks, "audit": audit}
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +75,13 @@ class TestFindRlsTargets:
         """C-1 regression: both RLS tables in the JOIN must be captured."""
 
         datasets = tables["dataset"]
-        tasks = tables["tasks"]
+        tasks = tables["task"]
         stmt = select(datasets, tasks).select_from(
             datasets.join(tasks, datasets.c.id == tasks.c.dataset_id),
         )
         targets = _find_rls_targets(stmt)
         names = sorted(t.name for t in targets)
-        assert names == ["dataset", "tasks"]
+        assert names == ["dataset", "task"]
 
     def test_ignores_unprotected_tables(self, tables: dict[str, Table]) -> None:
         stmt = select(tables["audit"])
@@ -93,9 +93,9 @@ class TestFindRlsTargets:
         assert [t.name for t in targets] == ["dataset"]
 
     def test_detects_delete_target(self, tables: dict[str, Table]) -> None:
-        stmt = delete(tables["tasks"])
+        stmt = delete(tables["task"])
         targets = _find_rls_targets(stmt)
-        assert [t.name for t in targets] == ["tasks"]
+        assert [t.name for t in targets] == ["task"]
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ class TestInjectTenantFilter:
         """Both RLS tables must receive their own qualified predicate."""
 
         datasets = tables["dataset"]
-        tasks = tables["tasks"]
+        tasks = tables["task"]
         stmt = select(datasets, tasks).select_from(
             datasets.join(tasks, datasets.c.id == tasks.c.dataset_id),
         )
@@ -130,7 +130,7 @@ class TestInjectTenantFilter:
 
         sql = str(rewritten.compile(compile_kwargs={"literal_binds": True}))
         assert "dataset.tenant_id" in sql
-        assert "tasks.tenant_id" in sql
+        assert "task.tenant_id" in sql
         # Must not produce a bare, ambiguous predicate.
         assert " tenant_id = " not in sql
 

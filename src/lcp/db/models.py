@@ -81,6 +81,68 @@ class Dataset(Base):
         return f"<Dataset uuid={self.dataset_uuid} status={self.status}>"
 
 
+class Task(Base):
+    """Mirror of the ``task`` table.
+
+    Tasks are submitted by users / schedulers and consumed by background
+    workers.  The state machine is enforced in :mod:`lcp.services.task_service`,
+    not in the model, so the column type stays a plain ``VARCHAR`` (matching
+    the DDL) rather than a SQL-level ENUM.  This lets us add new states
+    without an online DDL migration.
+    """
+
+    __tablename__ = "task"
+
+    id: Mapped[int] = mapped_column(_PK_BIGINT, primary_key=True, autoincrement=True)
+    task_uuid: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    task_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    dataset_uuid: Mapped[str] = mapped_column(String(64), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="default",
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    # ``priority`` follows the DDL: 0 (highest) .. 9 (lowest); 5 is default.
+    # ``SmallInteger`` is enough for [0, 9] and uses 2 bytes on MySQL.
+    priority: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=5)
+    progress: Mapped[Decimal] = mapped_column(
+        Numeric(5, 4), nullable=False, default=Decimal("0.0000"),
+    )
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # The ``idempotency_key`` is unique across the whole table (per DDL).
+    # Service layer turns the resulting IntegrityError into a 200/202 reply
+    # that returns the existing task instead of creating a duplicate.
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(128), unique=True, nullable=True,
+    )
+    params: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True,
+    )
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True,
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=False), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False), nullable=False, server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=False),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover - debug only
+        return f"<Task uuid={self.task_uuid} type={self.task_type} status={self.status}>"
+
+
 # Re-export common SQLAlchemy types so callers can ``from lcp.db.models import``
 # only what they need without pulling in the full SQLAlchemy namespace.
-__all__ = ["Base", "Dataset", "SmallInteger"]
+__all__ = ["Base", "Dataset", "Task"]
