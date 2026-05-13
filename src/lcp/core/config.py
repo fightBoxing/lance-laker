@@ -72,6 +72,26 @@ class Settings(BaseSettings):
     # -- Multi-tenant --------------------------------------------------------
     enforce_tenant_rls: bool = True
 
+    # -- Index watcher daemon -----------------------------------------------
+    # How often the event-driven index watcher polls every watch-enabled
+    # index for fresh lance versions / un-indexed rows.
+    #
+    # Trade-off: lower values shrink the worst-case "user-write -> index
+    # covered" SLA but increase MySQL + lance manifest read pressure.
+    # 10s leaves >100x headroom over the 1 min lifecycle planner cron
+    # while still hitting a single-digit-second SLA in the common case.
+    #
+    # Override via ``LCP_INDEX_WATCHER_INTERVAL_SECONDS=<float>`` (env
+    # var or ``.env``).  The watcher CLI also accepts
+    # ``--interval-seconds`` for ad-hoc overrides during incident
+    # response; CLI wins over env when both are set.
+    index_watcher_interval_seconds: float = Field(
+        default=10.0,
+        description=(
+            "Sleep this long between watch passes; CLI flag overrides."
+        ),
+    )
+
     # -- Lance data-plane ----------------------------------------------------
     # Object-storage credentials and endpoint for the lance dataset layer.
     # Empty defaults are intentional: tests and pure-control-plane unit
