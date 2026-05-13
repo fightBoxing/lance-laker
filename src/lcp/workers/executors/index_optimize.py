@@ -46,7 +46,7 @@ class IndexOptimizeExecutor(LifecycleExecutor):
         self,
         session: AsyncSession,
         *,
-        task: Task,  # noqa: ARG002 -- params not consumed yet
+        task: Task,
         dataset: Dataset,
     ) -> ExecutorResult:
         settings = get_settings()
@@ -54,9 +54,10 @@ class IndexOptimizeExecutor(LifecycleExecutor):
         # it and rollback before any row state changed.  This keeps the
         # invariant "OPTIMIZING -> READY only when lance succeeded".
         lance_index_count: int | None = None
+        post_optimize_version: int | None = None
         if settings.lance_storage_endpoint:
             storage_options = lance_io.build_storage_options(settings)
-            lance_index_count = await asyncio.to_thread(
+            lance_index_count, post_optimize_version = await asyncio.to_thread(
                 lance_io.optimize_indices,
                 dataset.storage_uri,
                 storage_options=storage_options,
@@ -71,10 +72,28 @@ class IndexOptimizeExecutor(LifecycleExecutor):
         )
         rows = list((await session.execute(stmt)).scalars().all())
 
+        # Watcher integration: pin ``last_seen_version`` to the dataset
+        # version that exists *after* lance committed the optimize, not
+        # to the version observed when the watcher fired.  Without this,
+        # every successful optimize bumps ``latest_version`` by one and
+        # the next watcher pass sees ``drift >= 1`` again, triggering a
+        # tight optimize-then-trigger loop on idle datasets.
+        #
+        # Fallback chain:
+        #   1. real lance run -> ``post_optimize_version`` (preferred)
+        #   2. watcher-emitted task with no real lance run (stub mode)
+        #      -> ``task.params['lance_version']``
+        #   3. neither -> leave the field untouched
+        seen_version: int | None = post_optimize_version
+        if seen_version is None:
+            seen_version = _extract_lance_version(task)
+
         now = utcnow_naive()
         for index in rows:
             index.status = "READY"
             index.last_optimized_at = now
+            if seen_version is not None:
+                index.last_seen_version = seen_version
 
         # Caller (worker) commits; this executor stays inside the worker
         # transaction so a crash before commit re-runs cleanly.
@@ -94,4 +113,26 @@ class IndexOptimizeExecutor(LifecycleExecutor):
             # Only present when lance was actually called; tests can
             # switch on this key to detect the real-lance code path.
             payload["lance_index_count"] = lance_index_count
+        if post_optimize_version is not None:
+            # Surface the version we wrote to ``last_seen_version`` so
+            # operators can correlate watcher logs with executor runs.
+            payload["post_optimize_version"] = post_optimize_version
         return ExecutorResult(payload=payload)
+
+
+def _extract_lance_version(task: Task) -> int | None:
+    """Best-effort extract ``lance_version`` from ``task.params``.
+
+    Returns ``None`` when the params are absent / malformed / non-numeric.
+    Watcher-emitted tasks always include this; planner / API tasks omit
+    it and the executor leaves ``last_seen_version`` untouched.
+    """
+
+    params = task.params or {}
+    value = params.get("lance_version")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

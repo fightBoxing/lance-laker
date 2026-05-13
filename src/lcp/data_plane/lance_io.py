@@ -233,19 +233,28 @@ def optimize_indices(
     uri: str,
     *,
     storage_options: dict[str, str] | None = None,
-) -> int:
-    """Trigger ``ds.optimize.optimize_indices``; return total index count after.
+) -> tuple[int, int]:
+    """Trigger ``ds.optimize.optimize_indices``; return ``(index_count, new_version)``.
 
     Lance's ``optimize_indices`` rebuilds the delta indices for every
     indexed column, so a single dataset-level call is enough -- we do
     NOT loop per column.
+
+    The second tuple element is the dataset's ``latest_version`` *after*
+    the optimize commit, which the watcher uses to dedupe its own
+    optimize-induced version drift (without it, every optimize bumps
+    the version by one and re-triggers the watcher in a tight loop).
     """
 
     ds = open_dataset(uri, storage_options=storage_options)
     ds.optimize.optimize_indices()
+    # Re-open to pick up the freshly committed version; ``ds`` from
+    # before the call still points at the pre-optimize manifest.
+    ds_after = open_dataset(uri, storage_options=storage_options)
+    new_version = int(ds_after.latest_version)
     # ``list_indices`` is the lance public API; older versions used
     # ``index_statistics``.  Total is informational only.
-    return _safe_count_indices(ds)
+    return _safe_count_indices(ds_after), new_version
 
 
 def create_index(
@@ -314,3 +323,92 @@ def _safe_count_indices(ds: Any) -> int:
         return len(list(fn()))
     except Exception:  # noqa: BLE001 -- read-only stat path; never crash worker
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Watcher helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class IndexLiveStats:
+    """Snapshot of one index's live state, used by the event-driven watcher.
+
+    All counts are integers; ``None`` is used only for missing fields when
+    the underlying lance version does not expose them.
+
+    The watcher consumes this dataclass instead of a raw dict so renames in
+    upstream lance keep blast radius to this single module.
+    """
+
+    latest_version: int
+    num_indexed_rows: int | None
+    num_unindexed_rows: int | None
+    num_indexed_fragments: int | None
+    num_unindexed_fragments: int | None
+    updated_at_timestamp_ms: int | None
+
+
+def read_index_stats(
+    uri: str,
+    index_name: str,
+    *,
+    storage_options: dict[str, str] | None = None,
+) -> IndexLiveStats | None:
+    """Read live stats for one named index; ``None`` if the index is missing.
+
+    The watcher uses this to decide whether to enqueue an INDEX_OPTIMIZE
+    task.  Implementation deliberately tolerates missing keys so older
+    lance versions degrade gracefully (the watcher then falls back to the
+    version-drift signal alone).
+    """
+
+    ds = open_dataset(uri, storage_options=storage_options)
+
+    latest_version = int(ds.latest_version)
+
+    # ``index_statistics`` returns a dict keyed by ``num_indexed_rows`` /
+    # ``num_unindexed_rows`` etc on lance 6.x; older versions either lack
+    # the method (we fall back) or return a different shape (we degrade).
+    raw: dict[str, Any] | None = None
+    fn = getattr(ds, "index_statistics", None)
+    if fn is not None:
+        try:
+            raw = fn(index_name)
+        except Exception:  # noqa: BLE001 -- index missing -> raw stays None
+            raw = None
+    if raw is None:
+        # Fallback: confirm the index name even exists; if it does, return
+        # a stats record with None counts so the watcher can still use
+        # ``latest_version`` for the version-drift signal.
+        names = {idx.get("name") for idx in ds.list_indices()}
+        if index_name not in names:
+            return None
+        return IndexLiveStats(
+            latest_version=latest_version,
+            num_indexed_rows=None,
+            num_unindexed_rows=None,
+            num_indexed_fragments=None,
+            num_unindexed_fragments=None,
+            updated_at_timestamp_ms=None,
+        )
+
+    return IndexLiveStats(
+        latest_version=latest_version,
+        num_indexed_rows=_maybe_int(raw.get("num_indexed_rows")),
+        num_unindexed_rows=_maybe_int(raw.get("num_unindexed_rows")),
+        num_indexed_fragments=_maybe_int(raw.get("num_indexed_fragments")),
+        num_unindexed_fragments=_maybe_int(raw.get("num_unindexed_fragments")),
+        updated_at_timestamp_ms=_maybe_int(raw.get("updated_at_timestamp_ms")),
+    )
+
+
+def _maybe_int(value: Any) -> int | None:
+    """Coerce numeric values to int; return None for None / unparseable."""
+
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None

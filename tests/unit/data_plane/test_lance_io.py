@@ -56,6 +56,7 @@ class _FakeDataset:
 
     uri: str
     rows: int = 5
+    latest_version: int = 1
     deleted_predicates: list[str] = field(default_factory=list)
     create_index_calls: list[dict[str, Any]] = field(default_factory=list)
     listed_indices: list[Any] = field(default_factory=list)
@@ -258,18 +259,24 @@ class TestCompactFiles:
 
 class TestOptimizeIndices:
 
-    def test_calls_lance_and_returns_index_count(
+    def test_calls_lance_and_returns_index_count_and_version(
         self, fake_lance: _FakeLance,
     ) -> None:
         # Pre-seed two fake indices on the dataset.
         ds_uri = "s3://b/t.lance"
-        ds_obj = _FakeDataset(uri=ds_uri)
+        ds_obj = _FakeDataset(uri=ds_uri, latest_version=42)
         ds_obj.listed_indices = [object(), object()]
         fake_lance._cache[ds_uri] = ds_obj
 
-        count = lance_io.optimize_indices(ds_uri, storage_options={"e": "x"})
+        count, version = lance_io.optimize_indices(
+            ds_uri, storage_options={"e": "x"},
+        )
         assert ds_obj.optimize.optimize_indices_calls == 1
         assert count == 2
+        # ``version`` is the latest_version of the dataset *after* the
+        # optimize commit -- the watcher uses this to dedupe its own
+        # optimize-induced version drift.
+        assert version == 42
 
     def test_missing_list_indices_returns_zero(
         self, fake_lance: _FakeLance, monkeypatch: pytest.MonkeyPatch,
@@ -277,13 +284,16 @@ class TestOptimizeIndices:
         # Cross-version safety: if list_indices is missing or raises, we
         # still return a number (0) instead of crashing the worker.
         ds_uri = "s3://b/t.lance"
-        ds_obj = _FakeDataset(uri=ds_uri)
+        ds_obj = _FakeDataset(uri=ds_uri, latest_version=7)
         # Drop list_indices so getattr() returns None.
         monkeypatch.setattr(ds_obj, "list_indices", None, raising=False)
         fake_lance._cache[ds_uri] = ds_obj
 
-        count = lance_io.optimize_indices(ds_uri, storage_options={"e": "x"})
+        count, version = lance_io.optimize_indices(
+            ds_uri, storage_options={"e": "x"},
+        )
         assert count == 0
+        assert version == 7
 
 
 # ---------------------------------------------------------------------------

@@ -121,12 +121,15 @@ def fake_lance_io(monkeypatch: pytest.MonkeyPatch) -> _LanceCalls:
             files_removed=8, files_added=1,
         )
 
-    def _optimize_indices(uri: str, *, storage_options: Any) -> int:
+    def _optimize_indices(uri: str, *, storage_options: Any) -> tuple[int, int]:
         calls.optimize_indices.append({
             "uri": uri,
             "storage_options": storage_options,
         })
-        return 3  # arbitrary index count
+        # Mirror the real signature: ``(index_count, post_optimize_version)``.
+        # The version is what ``IndexOptimizeExecutor`` writes back to
+        # ``last_seen_version`` to dedupe its own version drift.
+        return 3, 99
 
     def _create_index(
         uri: str,
