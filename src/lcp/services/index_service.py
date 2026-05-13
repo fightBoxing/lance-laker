@@ -211,10 +211,11 @@ async def optimize_index(
     dataset_uuid: str,
     index_name: str,
 ) -> Index:
-    """Move a READY index to OPTIMIZING and stamp ``last_optimized_at``.
+    """Move a READY index to OPTIMIZING and enqueue an INDEX_OPTIMIZE task.
 
-    Real optimisation work happens asynchronously; this method only flips the
-    state so concurrent callers cannot trigger overlapping optimisations.
+    The state flip is synchronous so concurrent callers cannot overlap; the
+    actual lance ``optimize_indices`` call runs asynchronously in the worker
+    that picks up the enqueued task and flips the row back to READY.
     """
 
     obj = await get_index(session, dataset_uuid, index_name)
@@ -227,6 +228,23 @@ async def optimize_index(
     obj.last_optimized_at = _utcnow()
     await session.commit()
     await session.refresh(obj)
+
+    # Async half: enqueue an INDEX_OPTIMIZE task so the worker actually runs
+    # ``lance.optimize_indices`` and promotes OPTIMIZING -> READY.  Submit
+    # AFTER the state flip commits so the task can never see a stale READY
+    # row.  Idempotency key keys off the row id AND the optimize stamp so a
+    # second optimize of the same index after it goes READY again gets a
+    # fresh task; HTTP retries within the same flip dedupe.
+    await task_service.submit_task(
+        session,
+        task_type="INDEX_OPTIMIZE",
+        dataset_uuid=dataset_uuid,
+        params={"index_name": index_name},
+        idempotency_key=(
+            f"optimize:{dataset_uuid}/{index_name}:"
+            f"{obj.id}:{obj.last_optimized_at.isoformat()}"
+        ),
+    )
     return obj
 
 
