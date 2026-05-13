@@ -25,6 +25,12 @@ class PolicyCreateRequest(BaseModel):
     ttl_days: int | None = Field(default=None, ge=1)
     compaction_threshold: dict[str, Any] | None = None
     index_optimize_cron: str | None = Field(default=None, max_length=64)
+    # Watcher (event-driven INDEX_OPTIMIZE) configuration; default-off
+    # to keep new policies behaviour-compatible with existing rows.
+    index_watch_enabled: bool = False
+    index_watch_min_unindexed_rows: int | None = Field(default=1000, ge=1)
+    index_watch_min_version_drift: int | None = Field(default=1, ge=1)
+    index_watch_stale_minutes: int | None = Field(default=30, ge=1)
     enabled: bool = True
 
 
@@ -42,6 +48,10 @@ class PolicyUpdateRequest(BaseModel):
     ttl_days: int | None = Field(default=None, ge=1)
     compaction_threshold: dict[str, Any] | None = None
     index_optimize_cron: str | None = Field(default=None, max_length=64)
+    index_watch_enabled: bool | None = None
+    index_watch_min_unindexed_rows: int | None = Field(default=None, ge=1)
+    index_watch_min_version_drift: int | None = Field(default=None, ge=1)
+    index_watch_stale_minutes: int | None = Field(default=None, ge=1)
 
 
 class PolicyResponse(BaseModel):
@@ -55,6 +65,10 @@ class PolicyResponse(BaseModel):
     ttl_days: int | None = None
     compaction_threshold: dict[str, Any] | None = None
     index_optimize_cron: str | None = None
+    index_watch_enabled: bool = False
+    index_watch_min_unindexed_rows: int | None = None
+    index_watch_min_version_drift: int | None = None
+    index_watch_stale_minutes: int | None = None
     enabled: bool
     last_run_at: datetime | None = None
     created_at: datetime

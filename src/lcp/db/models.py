@@ -184,6 +184,13 @@ class Index(Base):
     last_merged_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=False), nullable=True,
     )
+    # Watcher state: the lance ``latest_version`` last observed by the
+    # event-driven watcher.  Used to dedupe optimize triggers within the
+    # same dataset version, complementary to the planner's hourly bucket.
+    # NULL means the watcher has never observed this index.
+    last_seen_version: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True,
+    )
     error_message: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=False), nullable=False, server_default=func.now(),
@@ -232,6 +239,30 @@ class LifecyclePolicy(Base):
     )
     index_optimize_cron: Mapped[str | None] = mapped_column(
         String(64), nullable=True,
+    )
+    # ----- Watcher (event-driven INDEX_OPTIMIZE) configuration -----
+    # All four columns are nullable so existing rows stay valid; service
+    # layer applies sensible defaults when the policy is consulted.
+    # ``index_watch_enabled`` defaults to False to keep behaviour
+    # backward-compatible: only datasets that opt in are watched.
+    index_watch_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False,
+    )
+    # Trigger threshold: number of unindexed rows that triggers an
+    # INDEX_OPTIMIZE.  NULL means "do not consider this signal".
+    index_watch_min_unindexed_rows: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=1000,
+    )
+    # Trigger threshold: lance version drift (latest_version -
+    # last_seen_version).  NULL means "do not consider this signal".
+    index_watch_min_version_drift: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=1,
+    )
+    # Stale fallback: force an INDEX_OPTIMIZE if the index has not been
+    # optimised for this many minutes regardless of other signals.
+    # NULL means "no stale fallback".
+    index_watch_stale_minutes: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=30,
     )
     # MySQL stores ``enabled`` as TINYINT(1); SQLAlchemy ``Boolean`` maps
     # cleanly on both MySQL and SQLite, so no ``with_variant`` is needed.

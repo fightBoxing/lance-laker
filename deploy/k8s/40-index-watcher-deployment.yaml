@@ -1,0 +1,65 @@
+---
+# Index watcher Deployment.
+#
+# Single-replica long-running process that polls the lance data plane
+# every ``--interval-seconds`` and emits ``INDEX_OPTIMIZE`` tasks when a
+# READY index drifts beyond its lifecycle policy thresholds.
+#
+# Design notes
+# ------------
+# * Replica count is intentionally 1.  The watcher uses idempotency keys
+#   so multi-replica is *safe* but not yet *necessary*; we add HA only
+#   when the single instance becomes a measurable bottleneck.
+# * No HTTP probes -- the watcher has no listening port.  Liveness is
+#   indirectly observable via the ``task`` table (a stuck watcher stops
+#   producing ``watcher:*`` idempotency keys).
+# * Resources are sized for "scan a few hundred indexes every 10 s";
+#   bump CPU if you raise the interval.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lcp-index-watcher
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-index-watcher
+    app.kubernetes.io/component: watcher
+    app.kubernetes.io/part-of: lcp
+spec:
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: there is no benefit in running two
+    # watchers during a rollout (idempotency keys make it safe but it
+    # produces duplicate-skip log noise).
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lcp-index-watcher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lcp-index-watcher
+        app.kubernetes.io/component: watcher
+        app.kubernetes.io/part-of: lcp
+    spec:
+      # SIGTERM to drain: the CLI flips an asyncio.Event so the
+      # in-flight pass commits before the kubelet sends SIGKILL.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: watcher
+          image: lcp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "-m", "lcp.workers.index_watcher_cli"]
+          args:
+            - "--interval-seconds=10"
+          envFrom:
+            - configMapRef:
+                name: lcp-config
+            - secretRef:
+                name: lcp-secrets
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

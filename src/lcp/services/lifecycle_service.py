@@ -65,6 +65,10 @@ async def create_policy(
         ttl_days=payload.ttl_days,
         compaction_threshold=payload.compaction_threshold,
         index_optimize_cron=payload.index_optimize_cron,
+        index_watch_enabled=payload.index_watch_enabled,
+        index_watch_min_unindexed_rows=payload.index_watch_min_unindexed_rows,
+        index_watch_min_version_drift=payload.index_watch_min_version_drift,
+        index_watch_stale_minutes=payload.index_watch_stale_minutes,
         enabled=payload.enabled,
     )
     session.add(obj)

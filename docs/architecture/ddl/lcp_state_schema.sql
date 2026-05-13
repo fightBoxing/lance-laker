@@ -86,6 +86,7 @@ CREATE TABLE `vector_index` (
     `delta_count` INT UNSIGNED NOT NULL DEFAULT 0,
     `last_optimized_at` DATETIME(3) DEFAULT NULL,
     `last_merged_at` DATETIME(3) DEFAULT NULL,
+    `last_seen_version` BIGINT UNSIGNED DEFAULT NULL COMMENT 'lance latest_version last observed by event-driven watcher; NULL = never observed',
     `error_message` VARCHAR(1024) DEFAULT NULL,
     `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     `updated_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -163,6 +164,12 @@ CREATE TABLE `lifecycle_policy` (
     `ttl_days` INT UNSIGNED DEFAULT NULL COMMENT 'Delete data older than N days; NULL = never',
     `compaction_threshold` JSON DEFAULT NULL COMMENT 'e.g. {"min_small_fragments":100,"window":"1h"}',
     `index_optimize_cron` VARCHAR(64) DEFAULT NULL,
+    -- Watcher (event-driven INDEX_OPTIMIZE) configuration; default-off so
+    -- existing datasets are not affected when this feature lands.
+    `index_watch_enabled` TINYINT(1) NOT NULL DEFAULT 0,
+    `index_watch_min_unindexed_rows` INT UNSIGNED DEFAULT 1000 COMMENT 'unindexed-rows threshold; NULL disables this signal',
+    `index_watch_min_version_drift` INT UNSIGNED DEFAULT 1 COMMENT 'lance version-drift threshold; NULL disables this signal',
+    `index_watch_stale_minutes` INT UNSIGNED DEFAULT 30 COMMENT 'force optimise after N minutes; NULL disables stale fallback',
     `enabled` TINYINT(1) NOT NULL DEFAULT 1,
     `last_run_at` DATETIME(3) DEFAULT NULL,
     `created_at` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
