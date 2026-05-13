@@ -1,0 +1,31 @@
+# Build artefacts -- never copy these into the Docker image.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+*.egg-info/
+build/
+dist/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Tests + dev-only docs (kept on host but should not bloat the runtime
+# image; the image runs services, it does not run tests).
+tests/
+docs/
+.codebuddy/
+
+# Git metadata
+.git/
+.gitignore
+
+# Skeleton README is needed by setuptools (declared in pyproject) so
+# do NOT exclude README-skeleton.md.

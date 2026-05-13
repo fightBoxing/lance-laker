@@ -1,0 +1,59 @@
+---
+# Lifecycle worker Deployment.
+#
+# Generic worker: claims any task type.  If you want specialised pools
+# (e.g. INDEX_OPTIMIZE only), copy this manifest and pass
+# ``--task-type INDEX_OPTIMIZE`` via args.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lcp-worker
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: lcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lcp-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lcp-worker
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/part-of: lcp
+    spec:
+      # The worker has no listening port -- terminationGracePeriod gives
+      # SIGTERM enough time for the in-flight tick to drain to SUCCEEDED
+      # / FAILED before the kubelet sends SIGKILL.  See lifecycle_worker
+      # signal handler.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: lcp:dev
+          imagePullPolicy: IfNotPresent
+          # Override the image's default REST CMD with the worker
+          # entry-point.  Args are passed through to argparse.
+          command: ["python", "-m", "lcp.workers.lifecycle_worker"]
+          args:
+            - "--idle-seconds=2"
+            - "--busy-seconds=0.1"
+          envFrom:
+            - configMapRef:
+                name: lcp-config
+            - secretRef:
+                name: lcp-secrets
+          # No probes: the worker is a polling daemon with no HTTP
+          # surface.  A liveness probe that exec'd a Python script on
+          # the engine would defeat its own purpose; we rely on
+          # `kubectl logs` and the worker_registry table for liveness
+          # signals.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

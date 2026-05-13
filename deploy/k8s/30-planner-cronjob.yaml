@@ -1,0 +1,55 @@
+---
+# Planner CronJob -- one Pod per minute, each runs `plan_once` and exits.
+#
+# Why CronJob and not a Deployment with a sleep loop:
+# - CronJob gives k8s-native retry / backoff / failure history;
+# - if planner crashes mid-tick the next minute reruns cleanly thanks
+#   to per-policy idempotency keys (see lifecycle_planner_service);
+# - one Pod per minute keeps the engine pool tiny -- no stale long-
+#   lived connections.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lcp-planner
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-planner
+    app.kubernetes.io/component: planner
+    app.kubernetes.io/part-of: lcp
+spec:
+  schedule: "* * * * *"
+  # Don't pile up planner runs if the cluster is overloaded; skip until
+  # the next minute.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 30
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      activeDeadlineSeconds: 50
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: lcp-planner
+            app.kubernetes.io/component: planner
+            app.kubernetes.io/part-of: lcp
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: planner
+              image: lcp:dev
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "lcp.workers.lifecycle_planner_cli"]
+              envFrom:
+                - configMapRef:
+                    name: lcp-config
+                - secretRef:
+                    name: lcp-secrets
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi

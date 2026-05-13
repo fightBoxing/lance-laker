@@ -1,0 +1,89 @@
+---
+# REST API Deployment.
+#
+# 1 replica is enough for dev; the API is stateless so HPA-friendly later.
+# Resources kept tiny so the whole LCP stack co-exists with ray/fluss/daft
+# on a single Colima node.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lcp-api
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: lcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lcp-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lcp-api
+        app.kubernetes.io/component: api
+        app.kubernetes.io/part-of: lcp
+    spec:
+      containers:
+        - name: api
+          image: lcp:dev
+          # Pull policy:
+          # - dev: IfNotPresent so kubelet uses the locally-built image
+          #   in the docker daemon (Colima -> cri-dockerd shares it);
+          # - prod: Always with a real registry tag.
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: lcp-config
+            - secretRef:
+                name: lcp-secrets
+          ports:
+            - name: http
+              containerPort: 8080
+          # /healthz is implemented in src/lcp/api/rest/main.py and is
+          # cheap (no DB hit), so we use it for both probes.  initialDelay
+          # is generous to let the OIDC middleware warm up jwks fetcher.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lcp-api
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-api
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: lcp-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      # Pinned NodePort 30808 so curl http://127.0.0.1:30808/healthz works
+      # without re-running `kubectl get svc`.  Range 30000-32767 is the
+      # k8s NodePort default.
+      nodePort: 30808

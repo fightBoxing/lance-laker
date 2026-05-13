@@ -1,0 +1,61 @@
+---
+# Namespace, secrets, configmap for the LCP control plane.
+#
+# Why a dedicated namespace:
+# - keeps RBAC / network policies scoped to LCP
+# - allows wholesale teardown via `kubectl delete ns lcp` without
+#   touching neighbouring stacks (ray-system, daft-platform, fluss).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lcp
+  labels:
+    app.kubernetes.io/part-of: lcp
+---
+# Connection settings the three workloads share.  ConfigMap (not Secret)
+# because hostnames + bucket names are not sensitive.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lcp-config
+  namespace: lcp
+data:
+  # Cluster-internal MySQL endpoint -- mysql-cdc Pod in the default ns.
+  # Pydantic Settings env name = LCP_<UPPER(field_name)>; the field is
+  # `db_dsn` in src/lcp/core/config.py, hence `LCP_DB_DSN`.
+  LCP_DB_DSN: "mysql+aiomysql://lcp:lcp_dev_pwd@mysql-cdc.default.svc.cluster.local:3306/lcp"
+
+  # REST: bind to all interfaces inside the Pod (default is loopback,
+  # which would make the kubelet probe + Service unreachable).
+  LCP_REST_HOST: "0.0.0.0"
+  LCP_REST_PORT: "8080"
+
+  # gRPC same.
+  LCP_GRPC_HOST: "0.0.0.0"
+  LCP_GRPC_PORT: "50051"
+
+  # mTLS / OIDC: keep dev defaults, no real auth wired up here yet.
+  LCP_MTLS_REQUIRE_CLIENT_CERT: "false"
+  LCP_ENFORCE_TENANT_RLS: "false"
+  LCP_APP_ENV: "dev-k8s"
+
+  # Object-storage hints -- not consumed by current code, but recorded
+  # so a `kubectl describe cm` documents the intended MinIO endpoint
+  # for the planned lance integration.  The smoke script consumes these
+  # via the same names.
+  LCP_STORAGE_ENDPOINT_URL: "http://minio.daft-platform.svc.cluster.local:9000"
+  LCP_STORAGE_BUCKET: "lcp-lance"
+  LCP_STORAGE_REGION: "us-east-1"
+---
+# Secrets: MySQL password + MinIO credentials.  Created via stringData
+# (k8s base64-encodes for us) -- this is dev cluster; for prod use
+# external-secrets / sealed-secrets / vault.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lcp-secrets
+  namespace: lcp
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "minioadmin"
