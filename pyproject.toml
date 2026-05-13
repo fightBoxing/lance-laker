@@ -50,6 +50,14 @@ dev = [
     "ruff>=0.3.0",
     "mypy>=1.9.0",
 ]
+# Optional lance data-plane extras.  Install with `pip install .[lance]` when
+# the worker process must talk to a real lance dataset (object storage or
+# local fs).  Kept optional so unit/CI environments without native build
+# toolchains can still resolve the base package.
+lance = [
+    "pylance>=0.20.0",
+    "pyarrow>=15.0.0",
+]
 
 [project.scripts]
 lcp-rest = "lcp.api.rest.main:run"

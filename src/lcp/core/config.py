@@ -72,6 +72,31 @@ class Settings(BaseSettings):
     # -- Multi-tenant --------------------------------------------------------
     enforce_tenant_rls: bool = True
 
+    # -- Lance data-plane ----------------------------------------------------
+    # Object-storage credentials and endpoint for the lance dataset layer.
+    # Empty defaults are intentional: tests and pure-control-plane unit
+    # environments must not require a real bucket.  When the worker is
+    # deployed to talk to MinIO/S3, set ``LCP_LANCE_*`` env vars.
+    #
+    # Why a flat set of strings instead of a single ``storage_options`` dict:
+    # pydantic-settings parses dicts from JSON env vars, which is awkward
+    # for ops; ``LCP_LANCE_ACCESS_KEY=...`` is closer to the AWS CLI muscle
+    # memory operators already have.
+    lance_storage_endpoint: str = Field(
+        default="",
+        description="S3-compatible endpoint URL, e.g. http://minio:9000",
+    )
+    lance_storage_access_key: str = Field(default="", description="AWS_ACCESS_KEY_ID")
+    lance_storage_secret_key: str = Field(default="", description="AWS_SECRET_ACCESS_KEY")
+    lance_storage_region: str = Field(default="us-east-1", description="AWS region")
+    # MinIO in dev runs plain HTTP; production should terminate TLS upstream
+    # and flip this to False.
+    lance_storage_allow_http: bool = True
+    # Path-style requests: MinIO does not implement virtual-hosted-style
+    # bucket subdomains.  Real AWS S3 prefers virtual-hosted, so flip this
+    # off when pointing at AWS.
+    lance_storage_path_style: bool = True
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
