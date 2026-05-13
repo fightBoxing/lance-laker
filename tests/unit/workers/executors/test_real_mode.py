@@ -28,6 +28,7 @@ from lcp.data_plane import lance_io
 from lcp.db.models import Base, Dataset, Index, Task
 from lcp.workers.executors import (
     CompactionExecutor,
+    IndexBuildExecutor,
     IndexOptimizeExecutor,
     TtlDeleteExecutor,
 )
@@ -74,10 +75,12 @@ def lance_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(config_mod, "get_settings", lambda: fake)
     # Also patch the symbol that each executor imports by name.
     from lcp.workers.executors import compaction as compaction_mod
+    from lcp.workers.executors import index_build as index_build_mod
     from lcp.workers.executors import index_optimize as index_optimize_mod
     from lcp.workers.executors import ttl_delete as ttl_delete_mod
     monkeypatch.setattr(ttl_delete_mod, "get_settings", lambda: fake)
     monkeypatch.setattr(compaction_mod, "get_settings", lambda: fake)
+    monkeypatch.setattr(index_build_mod, "get_settings", lambda: fake)
     monkeypatch.setattr(index_optimize_mod, "get_settings", lambda: fake)
 
 
@@ -88,13 +91,16 @@ class _LanceCalls:
     delete_rows: list[dict[str, Any]]
     compact_files: list[dict[str, Any]]
     optimize_indices: list[dict[str, Any]]
+    create_index: list[dict[str, Any]]
 
 
 @pytest.fixture
 def fake_lance_io(monkeypatch: pytest.MonkeyPatch) -> _LanceCalls:
     """Replace lance_io functions so executors never touch the real lance."""
 
-    calls = _LanceCalls(delete_rows=[], compact_files=[], optimize_indices=[])
+    calls = _LanceCalls(
+        delete_rows=[], compact_files=[], optimize_indices=[], create_index=[],
+    )
 
     def _delete_rows(uri: str, predicate: str, *, storage_options: Any) -> int:
         calls.delete_rows.append({
@@ -122,9 +128,35 @@ def fake_lance_io(monkeypatch: pytest.MonkeyPatch) -> _LanceCalls:
         })
         return 3  # arbitrary index count
 
+    def _create_index(
+        uri: str,
+        *,
+        column: str,
+        index_type: str,
+        storage_options: Any,
+        replace: bool = False,
+        **index_params: Any,
+    ) -> dict[str, Any]:
+        calls.create_index.append({
+            "uri": uri,
+            "column": column,
+            "index_type": index_type,
+            "storage_options": storage_options,
+            "replace": replace,
+            "index_params": index_params,
+        })
+        return {
+            "uri": uri,
+            "column": column,
+            "index_type": index_type,
+            "replace": replace,
+            "params": dict(index_params),
+        }
+
     monkeypatch.setattr(lance_io, "delete_rows", _delete_rows)
     monkeypatch.setattr(lance_io, "compact_files", _compact_files)
     monkeypatch.setattr(lance_io, "optimize_indices", _optimize_indices)
+    monkeypatch.setattr(lance_io, "create_index", _create_index)
     return calls
 
 
@@ -377,3 +409,244 @@ class TestIndexOptimizeRealMode:
         # BEFORE touching the row.
         await session.refresh(idx)
         assert idx.status == "OPTIMIZING"
+
+
+# ---------------------------------------------------------------------------
+# INDEX_BUILD - real mode
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("lance_endpoint")
+class TestIndexBuildRealMode:
+    """Block B: ``BUILDING -> READY`` with a real lance.create_index call."""
+
+    async def _seed_index(
+        self,
+        session: AsyncSession,
+        *,
+        dataset_uuid: str,
+        index_name: str,
+    ) -> Index:
+        """Seed a vector_index row exactly as ``index_service.create_index``
+        would: ``BUILDING`` status, no last_optimized_at."""
+
+        idx = Index(
+            dataset_uuid=dataset_uuid,
+            index_name=index_name,
+            index_type="IVF_PQ",
+            column_name="embedding",
+            status="BUILDING",
+        )
+        session.add(idx)
+        await session.commit()
+        await session.refresh(idx)
+        return idx
+
+    async def test_calls_lance_create_index_then_promotes_named_row_only(
+        self,
+        session: AsyncSession,
+        fake_lance_io: _LanceCalls,
+    ) -> None:
+        """Happy path: lance.create_index runs, BUILDING -> READY, only on
+        the row named in task.params (Q2 = A scoping)."""
+
+        ds = await _make_dataset(session)
+        target = await self._seed_index(
+            session, dataset_uuid=ds.dataset_uuid, index_name="idx_target",
+        )
+        # A second BUILDING row that this task must NOT touch -- proves the
+        # executor scopes by index_name, not by dataset.
+        sibling = await self._seed_index(
+            session, dataset_uuid=ds.dataset_uuid, index_name="idx_other",
+        )
+
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            tenant_id=ds.tenant_id,
+            task_type="INDEX_BUILD",
+            params={
+                "index_name": "idx_target",
+                "column_name": "embedding",
+                "index_type": "IVF_PQ",
+                "params": {"num_partitions": 64, "num_sub_vectors": 8},
+            },
+        )
+
+        result = await IndexBuildExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        await session.commit()
+
+        # Lance was invoked exactly once with the right knobs.
+        assert len(fake_lance_io.create_index) == 1
+        call = fake_lance_io.create_index[0]
+        assert call["uri"] == ds.storage_uri
+        assert call["column"] == "embedding"
+        assert call["index_type"] == "IVF_PQ"
+        assert call["replace"] is True  # idempotent retry safety
+        assert call["index_params"] == {
+            "num_partitions": 64, "num_sub_vectors": 8,
+        }
+        assert call["storage_options"]["endpoint"] == "http://minio.test:9000"
+
+        # Target row promoted; sibling row untouched.
+        await session.refresh(target)
+        await session.refresh(sibling)
+        assert target.status == "READY"
+        assert target.last_optimized_at is not None
+        assert sibling.status == "BUILDING"
+        assert sibling.last_optimized_at is None
+
+        # Payload reflects real mode + the lance descriptor.
+        assert result.payload["mode"] == "real"
+        assert result.payload["index_name"] == "idx_target"
+        assert result.payload["lance_descriptor"]["column"] == "embedding"
+
+    async def test_missing_required_param_raises_value_error(
+        self,
+        session: AsyncSession,
+        fake_lance_io: _LanceCalls,
+    ) -> None:
+        """Defensive: malformed task fails fast, never touches lance."""
+
+        ds = await _make_dataset(session)
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            tenant_id=ds.tenant_id,
+            task_type="INDEX_BUILD",
+            params={"index_name": "idx_x"},  # missing column_name + index_type
+        )
+
+        with pytest.raises(ValueError, match="missing required params"):
+            await IndexBuildExecutor().execute(
+                session, task=task, dataset=ds,
+            )
+        # No lance call leaked through.
+        assert fake_lance_io.create_index == []
+
+    async def test_missing_index_row_raises_value_error(
+        self,
+        session: AsyncSession,
+        fake_lance_io: _LanceCalls,
+    ) -> None:
+        """If the named vector_index row is gone (dropped between submit
+        and execute), we fail loudly before doing any lance work."""
+
+        ds = await _make_dataset(session)  # no Index seeded
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            tenant_id=ds.tenant_id,
+            task_type="INDEX_BUILD",
+            params={
+                "index_name": "ghost",
+                "column_name": "embedding",
+                "index_type": "IVF_PQ",
+            },
+        )
+
+        with pytest.raises(ValueError, match="target index not found"):
+            await IndexBuildExecutor().execute(
+                session, task=task, dataset=ds,
+            )
+        assert fake_lance_io.create_index == []
+
+    async def test_lance_failure_keeps_status_building(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Invariant: BUILDING -> READY only when lance.create_index
+        succeeded.  A lance error must propagate AND leave the row in
+        BUILDING (the worker rolls back the txn around this executor)."""
+
+        ds = await _make_dataset(session)
+        idx = await self._seed_index(
+            session, dataset_uuid=ds.dataset_uuid, index_name="idx_z",
+        )
+
+        def _boom(uri: str, **kwargs: Any) -> dict[str, Any]:
+            raise RuntimeError("lance create_index exploded")
+
+        monkeypatch.setattr(lance_io, "create_index", _boom)
+
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            tenant_id=ds.tenant_id,
+            task_type="INDEX_BUILD",
+            params={
+                "index_name": "idx_z",
+                "column_name": "embedding",
+                "index_type": "IVF_PQ",
+            },
+        )
+        with pytest.raises(RuntimeError, match="exploded"):
+            await IndexBuildExecutor().execute(
+                session, task=task, dataset=ds,
+            )
+
+        await session.refresh(idx)
+        assert idx.status == "BUILDING"
+        assert idx.last_optimized_at is None
+
+
+# ---------------------------------------------------------------------------
+# INDEX_BUILD - stub mode (no lance endpoint configured)
+# ---------------------------------------------------------------------------
+
+
+class TestIndexBuildStubMode:
+    """Without a lance endpoint, the executor still flips BUILDING ->
+    READY (the LCP state-machine transition is real LCP work) but
+    declines to call lance."""
+
+    async def test_stub_promotes_state_without_calling_lance(
+        self,
+        session: AsyncSession,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lcp.core.config import Settings
+        from lcp.workers.executors import index_build as index_build_mod
+
+        # Empty endpoint -> stub path.
+        empty = Settings(lance_storage_endpoint="")
+        monkeypatch.setattr(index_build_mod, "get_settings", lambda: empty)
+
+        # If lance_io.create_index is reached, fail the test loudly: the
+        # stub path must not touch the data plane.
+        def _must_not_call(*args: Any, **kwargs: Any) -> None:
+            raise AssertionError(
+                "stub mode must not invoke lance_io.create_index",
+            )
+        monkeypatch.setattr(lance_io, "create_index", _must_not_call)
+
+        ds = await _make_dataset(session)
+        idx = Index(
+            dataset_uuid=ds.dataset_uuid,
+            index_name="stub_idx",
+            index_type="IVF_PQ",
+            column_name="embedding",
+            status="BUILDING",
+        )
+        session.add(idx)
+        await session.commit()
+        await session.refresh(idx)
+
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            tenant_id=ds.tenant_id,
+            task_type="INDEX_BUILD",
+            params={
+                "index_name": "stub_idx",
+                "column_name": "embedding",
+                "index_type": "IVF_PQ",
+            },
+        )
+        result = await IndexBuildExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        await session.commit()
+
+        await session.refresh(idx)
+        assert idx.status == "READY"
+        assert result.payload["mode"] == "stub"
+        assert result.payload["would_call"] == "lance.LanceDataset.create_index"

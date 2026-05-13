@@ -106,11 +106,13 @@ def build_default_registry() -> dict[str, LifecycleExecutor]:
     # itself imports from this base module.  Importing them at module
     # top level would create an import cycle.
     from lcp.workers.executors.compaction import CompactionExecutor
+    from lcp.workers.executors.index_build import IndexBuildExecutor
     from lcp.workers.executors.index_optimize import IndexOptimizeExecutor
     from lcp.workers.executors.ttl_delete import TtlDeleteExecutor
 
     return {
         TtlDeleteExecutor.task_type: TtlDeleteExecutor(),
         CompactionExecutor.task_type: CompactionExecutor(),
+        IndexBuildExecutor.task_type: IndexBuildExecutor(),
         IndexOptimizeExecutor.task_type: IndexOptimizeExecutor(),
     }

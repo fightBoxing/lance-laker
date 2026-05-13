@@ -15,12 +15,14 @@ from lcp.workers.executors.base import (
     build_default_registry,
 )
 from lcp.workers.executors.compaction import CompactionExecutor
+from lcp.workers.executors.index_build import IndexBuildExecutor
 from lcp.workers.executors.index_optimize import IndexOptimizeExecutor
 from lcp.workers.executors.ttl_delete import TtlDeleteExecutor
 
 __all__ = [
     "CompactionExecutor",
     "ExecutorResult",
+    "IndexBuildExecutor",
     "IndexOptimizeExecutor",
     "LifecycleExecutor",
     "TtlDeleteExecutor",

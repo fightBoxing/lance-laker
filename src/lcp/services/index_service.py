@@ -16,7 +16,11 @@ So a malicious caller cannot read another tenant's index even though
 
 State machine
 -------------
-``BUILDING -> READY``  (worker)
+``create_index`` inserts a ``BUILDING`` row AND enqueues an
+``INDEX_BUILD`` task so a worker can actually build the on-disk ANN
+index; the worker flips the row to ``READY`` once lance succeeds.
+
+``BUILDING -> READY``  (INDEX_BUILD worker)
 ``READY -> OPTIMIZING -> READY``
 ``READY -> MERGING -> READY``
 ``* -> FAILED``        (worker; preserves error_message)
@@ -34,7 +38,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lcp.db.models import Index
-from lcp.services import dataset_service
+from lcp.services import dataset_service, task_service
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -124,6 +128,25 @@ async def create_index(
         ) from exc
     await session.commit()
     await session.refresh(obj)
+
+    # Async half of the build flow: hand a task to the worker so it
+    # actually issues lance.create_index and promotes BUILDING -> READY.
+    # We purposely DO this AFTER the index row commits so the row always
+    # exists before any worker could see the task.  Idempotency key:
+    # ``build:<dataset>/<name>:<id>`` — the row ``id`` is stable and guards
+    # against replays from retrying HTTP clients.
+    await task_service.submit_task(
+        session,
+        task_type="INDEX_BUILD",
+        dataset_uuid=dataset_uuid,
+        params={
+            "index_name": index_name,
+            "column_name": column_name,
+            "index_type": index_type,
+            "params": params or {},
+        },
+        idempotency_key=f"build:{dataset_uuid}/{index_name}:{obj.id}",
+    )
     return obj
 
 
