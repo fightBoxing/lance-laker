@@ -29,13 +29,13 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lcp.db.models import VectorizationRule
+from lcp.db.models import Task, VectorizationRule
 from lcp.schemas.vectorization import (
     RuleCreateRequest,
     RuleUpdateRequest,
     validate_cron_required_when_scheduled,
 )
-from lcp.services import dataset_service
+from lcp.services import dataset_service, task_service
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -52,6 +52,10 @@ class RuleAlreadyExistsError(Exception):
 
 class RuleValidationError(Exception):
     """Raised when a merged-state cross-field invariant is violated."""
+
+
+class RuleDisabledError(Exception):
+    """Raised when ``vectorize-now`` targets a disabled rule."""
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +191,51 @@ async def set_enabled(
         await session.commit()
         await session.refresh(obj)
     return obj
+
+
+async def submit_vectorize_task(
+    session: AsyncSession,
+    dataset_uuid: str,
+    target_column: str,
+) -> tuple[Task, bool]:
+    """Enqueue a ``VECTORIZE`` task for the given rule.
+
+    Used by ``POST /v1/datasets/{uuid}/vectorization-rules/{col}/vectorize-now``
+    so callers can trigger a one-off run without waiting for a planner /
+    cron tick.  Mirrors ``index_service.create_index`` -> ``task_service.
+    submit_task`` wiring (Karpathy rule 3: same path, same idempotency-key
+    shape).
+
+    Returns ``(task, created)`` so the router can map the boolean to
+    202 Accepted (fresh) vs 200 OK (idempotent replay) the same way the
+    /v1/tasks endpoint already does.
+
+    Raises:
+        DatasetNotFoundError: cross-tenant or unknown dataset.
+        RuleNotFoundError:    rule row missing.
+        RuleDisabledError:    rule exists but ``enabled=False``; running a
+            disabled rule would surprise operators who turned it off.
+    """
+
+    rule = await get_rule(session, dataset_uuid, target_column)
+    if not rule.enabled:
+        raise RuleDisabledError(
+            f"vectorization rule on {target_column!r} is disabled; "
+            f"enable it before requesting vectorize-now",
+        )
+
+    # Idempotency key: per-rule, per-row-id so two rapid HTTP retries from
+    # the same client coalesce, but a re-create of the rule (different id)
+    # gets its own task.  Matches the ``build:<dataset>/<name>:<id>`` shape
+    # used by index_service.create_index.
+    idempotency_key = f"vectorize:{dataset_uuid}/{target_column}:{rule.id}"
+    return await task_service.submit_task(
+        session,
+        task_type="VECTORIZE",
+        dataset_uuid=dataset_uuid,
+        params={"vectorization_rule_id": rule.id},
+        idempotency_key=idempotency_key,
+    )
 
 
 # ---------------------------------------------------------------------------

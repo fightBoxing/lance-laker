@@ -905,6 +905,107 @@ class TestVectorizationRouter:
         )
         assert resp_a.status_code == 200
 
+    async def test_vectorize_now_creates_task(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """POST .../vectorize-now enqueues a VECTORIZE task."""
+
+        token = issue_token(tenant_id="t-vec-now")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v/vectorize-now",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Task wire shape uses ``type`` (not ``task_type``); validates
+        # the executor's task_type matches schemas/task.py Literal.
+        assert body["type"] == "VECTORIZE"
+        assert body["status"] == "PENDING"
+        assert body["dataset_uuid"] == ds_uuid
+        # Params must carry the rule's primary key so the worker can
+        # look the rule back up under tenant scope.
+        assert "vectorization_rule_id" in body["params"]
+
+    async def test_vectorize_now_idempotent_on_replay(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """Two rapid posts return the same task_uuid (idempotency_key)."""
+
+        token = issue_token(tenant_id="t-vec-idem")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        first = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v/vectorize-now",
+            headers=_auth(token),
+        )
+        second = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v/vectorize-now",
+            headers=_auth(token),
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert first.json()["task_uuid"] == second.json()["task_uuid"]
+
+    async def test_vectorize_now_404_when_rule_missing(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-vec-missing")
+        ds_uuid = await self._create_dataset(http_client, token)
+        # No rule created -> 404.
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/no-such/vectorize-now",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 404
+
+    async def test_vectorize_now_409_when_rule_disabled(
+        self, http_client: Any, issue_token: Any,
+    ) -> None:
+        """Running a disabled rule would surprise operators; 409 instead."""
+
+        token = issue_token(tenant_id="t-vec-disabled")
+        ds_uuid = await self._create_dataset(http_client, token)
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules",
+            headers=_auth(token),
+            json={
+                "target_column": "v",
+                "source_columns": ["a"],
+                "model_name": "m",
+                "model_version": "1",
+            },
+        )
+        await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v/disable",
+            headers=_auth(token),
+        )
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/vectorization-rules/v/vectorize-now",
+            headers=_auth(token),
+        )
+        assert resp.status_code == 409
+        assert resp.json()["detail"]["code"] == "RULE_DISABLED"
+
 
 # ---------------------------------------------------------------------------
 # meta
@@ -1065,6 +1166,7 @@ class TestRouteTableContract:
             "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}",
             "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/enable",
             "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/disable",
+            "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/vectorize-now",
             "/v1/meta/sync",
             "/v1/meta/sync/{run_id}",
             "/v1/meta/datasets/{dataset_id}/snapshot",

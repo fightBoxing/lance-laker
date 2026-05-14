@@ -310,7 +310,7 @@ class TestDefaultRegistry:
         registry = build_default_registry()
         assert set(registry) == {
             "TTL_DELETE", "COMPACTION", "INDEX_BUILD", "INDEX_OPTIMIZE",
-            "EMBEDDING",
+            "VECTORIZE",
         }
 
     def test_registry_returns_fresh_instances_each_call(self) -> None:

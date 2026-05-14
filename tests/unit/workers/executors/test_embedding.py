@@ -7,7 +7,7 @@ mock-only in slice 3, so we focus on:
 * the contract param check (``vectorization_rule_id``);
 * DB lookup error paths (rule missing, rule disabled);
 * payload contract (every field a downstream consumer relies on);
-* registry wiring (``build_default_registry`` includes ``"EMBEDDING"``).
+* registry wiring (``build_default_registry`` includes ``"VECTORIZE"``).
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def _make_task(
 ) -> Task:
     return Task(
         task_uuid=str(uuid.uuid4()),
-        task_type="EMBEDDING",
+        task_type="VECTORIZE",
         dataset_uuid=dataset_uuid,
         tenant_id="acme",
         status="RUNNING",
@@ -248,6 +248,6 @@ class TestRegistry:
 
     def test_default_registry_includes_embedding(self) -> None:
         registry = build_default_registry()
-        assert "EMBEDDING" in registry
+        assert "VECTORIZE" in registry
         # And the registered instance must be an EmbeddingExecutor.
-        assert isinstance(registry["EMBEDDING"], EmbeddingExecutor)
+        assert isinstance(registry["VECTORIZE"], EmbeddingExecutor)

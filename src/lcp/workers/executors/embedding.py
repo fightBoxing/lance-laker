@@ -1,10 +1,10 @@
-"""EMBEDDING executor: computes vectors for a vectorization_rule.
+"""VECTORIZE executor: computes vectors for a vectorization_rule.
 
 Why this executor exists
 ------------------------
 :mod:`lcp.services.vectorization_service` lets users create a
 ``vectorization_rule`` (target column + source columns + model).  This
-executor is the async half: it consumes ``EMBEDDING`` tasks the REST
+executor is the async half: it consumes ``VECTORIZE`` tasks the REST
 layer (or a future planner) enqueues against that rule and runs the
 embedding model.
 
@@ -66,7 +66,7 @@ _PROBE_TEXTS: tuple[str, ...] = ("__lcp_embedding_probe__",)
 class EmbeddingExecutor(LifecycleExecutor):
     """Compute embeddings for a vectorization_rule (mock-model slice)."""
 
-    task_type = "EMBEDDING"
+    task_type = "VECTORIZE"
 
     async def execute(
         self,
@@ -79,7 +79,7 @@ class EmbeddingExecutor(LifecycleExecutor):
         rule_id = params.get("vectorization_rule_id")
         if rule_id is None:
             raise ValueError(
-                "EMBEDDING task is missing 'vectorization_rule_id' in params",
+                "VECTORIZE task is missing 'vectorization_rule_id' in params",
             )
 
         # Single anchor; pull the rest from the rule row.  Same pattern
@@ -91,14 +91,14 @@ class EmbeddingExecutor(LifecycleExecutor):
         rule = (await session.execute(stmt)).scalar_one_or_none()
         if rule is None:
             raise ValueError(
-                f"EMBEDDING target vectorization_rule not found: "
+                f"VECTORIZE target vectorization_rule not found: "
                 f"id={rule_id} dataset={dataset.dataset_uuid}",
             )
         if not rule.enabled:
             # Defensive: REST layer should already have rejected, but
             # an old enqueued task could outlive a disable.
             raise ValueError(
-                f"EMBEDDING vectorization_rule is disabled: id={rule_id}",
+                f"VECTORIZE vectorization_rule is disabled: id={rule_id}",
             )
 
         # Compute a probe vector so the payload reports the model's

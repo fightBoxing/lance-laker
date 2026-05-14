@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lcp.api.rest.deps import PrincipalDep, SessionDep
 from lcp.core.tenant import TenantPrincipal
+from lcp.schemas.task import TaskResponse
 from lcp.schemas.vectorization import (
     RuleCreateRequest,
     RuleListResponse,
@@ -229,3 +230,41 @@ async def disable_rule(
             f"on dataset {dataset_uuid}",
         ) from exc
     return RuleResponse.model_validate(obj)
+
+
+@router.post(
+    "/{target_column}/vectorize-now",
+    response_model=TaskResponse,
+    summary="Trigger one-off vectorize task",
+)
+async def vectorize_now(
+    dataset_uuid: str,
+    target_column: str,
+    session: Annotated[AsyncSession, SessionDep],
+    _principal: Annotated[TenantPrincipal, PrincipalDep],
+) -> TaskResponse:
+    """Enqueue a one-off ``VECTORIZE`` task for the rule.
+
+    Idempotent per ``(dataset_uuid, target_column, rule_id)``: a second
+    request returns the existing task instead of creating a duplicate,
+    so retries from a flaky client are safe.
+
+    Returns the task row; the worker will eventually transition it to
+    ``SUCCEEDED`` / ``FAILED`` and the caller can poll
+    ``GET /v1/tasks/{task_uuid}`` for the outcome.
+    """
+
+    try:
+        task, _created = await vectorization_service.submit_vectorize_task(
+            session, dataset_uuid, target_column,
+        )
+    except dataset_service.DatasetNotFoundError as exc:
+        raise _not_found(f"dataset {dataset_uuid} not found") from exc
+    except vectorization_service.RuleNotFoundError as exc:
+        raise _not_found(
+            f"rule on column {target_column!r} not found "
+            f"on dataset {dataset_uuid}",
+        ) from exc
+    except vectorization_service.RuleDisabledError as exc:
+        raise _conflict("RULE_DISABLED", str(exc)) from exc
+    return TaskResponse.model_validate(task)
