@@ -138,6 +138,56 @@ async def test_bearer_auth_attaches_authorization_header() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ping() — connectivity probe
+# ---------------------------------------------------------------------------
+
+
+async def test_ping_hits_catalog_path_and_returns_name() -> None:
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        # Gravitino's typical wrapped shape for a single catalog GET.
+        return httpx.Response(
+            200,
+            json={
+                "code": 0,
+                "catalog": {
+                    "name": "lance_oss",
+                    "type": "fileset",
+                    "provider": "hadoop",
+                    "comment": None,
+                },
+            },
+        )
+
+    async with _make_client(handler) as client:
+        name = await client.ping()
+
+    assert name == "lance_oss"
+    assert captured["url"].endswith("/api/metalakes/lance_laker/catalogs/lance_oss")
+
+
+async def test_ping_tolerates_flat_response_shape() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"name": "lance_oss", "type": "fileset"})
+
+    async with _make_client(handler) as client:
+        name = await client.ping()
+
+    assert name == "lance_oss"
+
+
+async def test_ping_raises_not_found_when_catalog_missing() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="catalog not found")
+
+    async with _make_client(handler) as client:
+        with pytest.raises(GravitinoNotFoundError):
+            await client.ping()
+
+
+# ---------------------------------------------------------------------------
 # Parsing — wrapped vs flat shapes
 # ---------------------------------------------------------------------------
 

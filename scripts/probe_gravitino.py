@@ -6,13 +6,20 @@ from where LCP runs, before wiring the client into the meta-sync service.
 
 Usage::
 
+    # Connectivity-only (works on a freshly-created catalog with no schemas):
     LCP_GRAVITINO_URL=http://gravitino.gravitino-system.svc.cluster.local:8090 \\
     LCP_GRAVITINO_METALAKE=lance_laker \\
     LCP_GRAVITINO_CATALOG=lance_oss \\
-    python scripts/probe_gravitino.py public
+    python scripts/probe_gravitino.py
+
+    # Deeper probe, when the catalog has at least one schema:
+    python scripts/probe_gravitino.py public --fileset embeddings
 
 Args:
-    schema: schema name to list filesets under (positional, required).
+    schema: schema name to list filesets under (positional, optional).
+        When omitted, the probe only verifies connectivity + that the
+        configured metalake/catalog exist (via ``client.ping()``); useful
+        for catalogs that have not yet had any schemas created.
 
 Output:
     JSON-ish lines with a one-line summary per fileset; non-zero exit on
@@ -32,7 +39,7 @@ from lcp.integrations.gravitino import (
 )
 
 
-async def _run(schema: str, fileset: str | None) -> int:
+async def _run(schema: str | None, fileset: str | None) -> int:
     settings = get_settings()
     if not settings.gravitino_url:
         print("LCP_GRAVITINO_URL is empty; refusing to probe.", file=sys.stderr)
@@ -47,6 +54,16 @@ async def _run(schema: str, fileset: str | None) -> int:
 
     try:
         async with GravitinoClient.from_settings(settings) as client:
+            # Always do the cheap connectivity check first.  This isolates
+            # "URL/metalake/catalog/auth wrong" from "schema wrong" so an
+            # operator reading the logs knows which knob to turn.
+            catalog_name = await client.ping()
+            print(f"[probe] ping ok: catalog={catalog_name!r}")
+
+            if schema is None:
+                print("[probe] no schema supplied; connectivity-only probe done.")
+                return 0
+
             names = await client.list_filesets(schema)
             print(f"[probe] found {len(names)} filesets under schema={schema!r}")
             for name in names:
@@ -67,7 +84,15 @@ async def _run(schema: str, fileset: str | None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("schema", help="Gravitino schema name (e.g. 'public')")
+    parser.add_argument(
+        "schema",
+        nargs="?",
+        default=None,
+        help=(
+            "Gravitino schema name (e.g. 'public').  Optional: when omitted, "
+            "the probe only verifies connectivity to the metalake/catalog."
+        ),
+    )
     parser.add_argument(
         "--fileset",
         default=None,

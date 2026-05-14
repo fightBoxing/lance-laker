@@ -222,6 +222,28 @@ class GravitinoClient:
 
     # ------- public API ---------------------------------------------------
 
+    async def ping(self) -> str:
+        """Cheapest call that proves URL + metalake + catalog + auth all line up.
+
+        Hits ``GET /api/metalakes/{metalake}/catalogs/{catalog}`` and returns
+        the catalog name from the response.  Used by:
+
+        - ``scripts/probe_gravitino.py`` when no schema is supplied (pure
+          connectivity check, useful when the catalog has zero schemas yet).
+        - the meta-sync CronJob's startup readiness probe (planned).
+
+        Raises :class:`GravitinoNotFoundError` if the metalake or catalog is
+        missing — which is exactly what an operator wants to see early
+        instead of hitting a 404 later from inside ``list_filesets``.
+        """
+
+        path = f"/api/metalakes/{self._metalake}/catalogs/{self._catalog}"
+        payload = await self._get_json(path)
+        # Gravitino returns ``{"code": 0, "catalog": {...}}``; tolerate flat shape too.
+        body = payload.get("catalog") if "catalog" in payload else payload
+        name = body.get("name") if isinstance(body, dict) else None
+        return str(name) if name else self._catalog
+
     async def list_filesets(self, schema: str) -> list[str]:
         """Return fileset *names* under ``{metalake}/{catalog}/{schema}``.
 

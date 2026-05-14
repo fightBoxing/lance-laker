@@ -53,8 +53,11 @@ data:
   # and the REST endpoint returns 503; both are intentional fallbacks.
   # Set this to the cluster-internal Gravitino endpoint when wiring
   # the real catalog (e.g. http://gravitino.gravitino.svc.cluster.local:8090).
-  LCP_GRAVITINO_URL: ""
-  LCP_GRAVITINO_METALAKE: "metalake_demo"
+  # Wired to the daft-platform Gravitino instance: probed via
+  #   kubectl exec -n daft-platform gravitino -- curl localhost:8090/api/metalakes
+  # which returns {"name":"daft_platform", catalogs:[..., lance, lance_multimodal]}.
+  LCP_GRAVITINO_URL: "http://gravitino.daft-platform.svc.cluster.local:8090"
+  LCP_GRAVITINO_METALAKE: "daft_platform"
   LCP_GRAVITINO_CATALOG: "lance"
   LCP_GRAVITINO_AUTH_TYPE: "none"
   LCP_GRAVITINO_REQUEST_TIMEOUT_SECONDS: "10"

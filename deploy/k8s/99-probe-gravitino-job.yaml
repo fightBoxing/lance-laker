@@ -18,9 +18,11 @@
 #      LCP_GRAVITINO_URL (e.g. http://gravitino.gravitino-system.svc
 #      .cluster.local:8090) and the right METALAKE / CATALOG values,
 #      then:  kubectl apply -f deploy/k8s/00-namespace-config.yaml
-#   2. Edit the `args:` line below to your real schema name (the
-#      placeholder __FILL_ME_SCHEMA__ will fail loudly so we never
-#      silently probe the wrong namespace).
+#   2. (Optional) edit the `args:` line below to a real schema name
+#      to probe filesets under it.  The default (no args) runs a pure
+#      connectivity probe via client.ping(), which is what we want when
+#      the catalog has no schemas yet -- it still proves URL + metalake
+#      + catalog + auth all line up.
 #   3. kubectl apply -f deploy/k8s/99-probe-gravitino-job.yaml
 #   4. kubectl -n lcp wait --for=condition=complete \
 #        job/lcp-probe-gravitino --timeout=60s
@@ -60,16 +62,17 @@ spec:
           image: lcp:dev
           imagePullPolicy: IfNotPresent
           command: ["python", "scripts/probe_gravitino.py"]
-          # Positional schema arg.  Replace __FILL_ME_SCHEMA__ with a
-          # real Gravitino schema (e.g. "public") that has at least one
-          # fileset under it; otherwise the probe will succeed but
-          # report "found 0 filesets", which still proves connectivity
-          # but tells us nothing about data shape.
+          # Connectivity-only probe: scripts/probe_gravitino.py treats
+          # the schema arg as optional and falls back to client.ping(),
+          # which hits GET /api/metalakes/{metalake}/catalogs/{catalog}.
+          # That's exactly the right level of check when the catalog
+          # has no schemas yet -- it still proves URL + metalake +
+          # catalog + auth all line up, which is what P0-1 needs.
           #
-          # Optional: append "--fileset", "<name>" to also dump one
-          # fileset's properties for end-to-end mapping verification.
-          args:
-            - "__FILL_ME_SCHEMA__"
+          # When you later have a real schema, append it here, e.g.:
+          #   args: ["public"]
+          # and optionally `--fileset <name>` to dump one fileset's
+          # properties for end-to-end mapping verification.
           envFrom:
             - configMapRef:
                 name: lcp-config
