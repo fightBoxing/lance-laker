@@ -132,18 +132,29 @@ async def create_index(
     # exists before any worker could see the task.  Idempotency key:
     # ``build:<dataset>/<name>:<id>`` — the row ``id`` is stable and guards
     # against replays from retrying HTTP clients.
-    await task_service.submit_task(
-        session,
-        task_type="INDEX_BUILD",
-        dataset_uuid=dataset_uuid,
-        params={
-            "index_name": index_name,
-            "column_name": column_name,
-            "index_type": index_type,
-            "params": params or {},
-        },
-        idempotency_key=f"build:{dataset_uuid}/{index_name}:{obj.id}",
-    )
+    #
+    # Safety net: if task submission fails the index row is already
+    # committed in BUILDING state with no worker coming.  Catch any
+    # exception, flip the row to FAILED so callers can see what happened,
+    # and re-raise so the HTTP response is still an error.
+    try:
+        await task_service.submit_task(
+            session,
+            task_type="INDEX_BUILD",
+            dataset_uuid=dataset_uuid,
+            params={
+                "index_name": index_name,
+                "column_name": column_name,
+                "index_type": index_type,
+                "params": params or {},
+            },
+            idempotency_key=f"build:{dataset_uuid}/{index_name}:{obj.id}",
+        )
+    except Exception as exc:
+        obj.status = "FAILED"
+        obj.error_message = f"task submission failed: {exc}"
+        await session.commit()
+        raise
     return obj
 
 
@@ -230,16 +241,26 @@ async def optimize_index(
     # row.  Idempotency key keys off the row id AND the optimize stamp so a
     # second optimize of the same index after it goes READY again gets a
     # fresh task; HTTP retries within the same flip dedupe.
-    await task_service.submit_task(
-        session,
-        task_type="INDEX_OPTIMIZE",
-        dataset_uuid=dataset_uuid,
-        params={"index_name": index_name},
-        idempotency_key=(
-            f"optimize:{dataset_uuid}/{index_name}:"
-            f"{obj.id}:{obj.last_optimized_at.isoformat()}"
-        ),
-    )
+    #
+    # Safety net: if task submission fails the index is stuck in OPTIMIZING.
+    # Roll it back to READY and re-raise so the HTTP response is still an
+    # error and the caller can retry cleanly.
+    try:
+        await task_service.submit_task(
+            session,
+            task_type="INDEX_OPTIMIZE",
+            dataset_uuid=dataset_uuid,
+            params={"index_name": index_name},
+            idempotency_key=(
+                f"optimize:{dataset_uuid}/{index_name}:"
+                f"{obj.id}:{obj.last_optimized_at.isoformat()}"
+            ),
+        )
+    except Exception as exc:
+        obj.status = "READY"
+        obj.error_message = f"task submission failed: {exc}"
+        await session.commit()
+        raise
     return obj
 
 
