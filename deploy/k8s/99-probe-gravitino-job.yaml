@@ -1,0 +1,84 @@
+---
+# One-shot Job that runs scripts/probe_gravitino.py against the
+# in-cluster Gravitino endpoint.
+#
+# Why this exists:
+# - LCP integrations/gravitino/client.py is unit-tested with
+#   httpx.MockTransport, so its wire format is locally proven; what
+#   *isn't* proven is whether DNS, auth, and metalake/catalog/schema
+#   names line up against your real Gravitino deployment.  This Job
+#   exercises exactly that, in-cluster, before we point the meta-sync
+#   CronJob at production data.
+# - We reuse the same ConfigMap (lcp-config) and Secret (lcp-secrets)
+#   that the production meta-sync CronJob uses.  If probe works,
+#   meta-sync will too -- zero env drift between the two.
+#
+# How to run:
+#   1. Make sure deploy/k8s/00-namespace-config.yaml has a real
+#      LCP_GRAVITINO_URL (e.g. http://gravitino.gravitino-system.svc
+#      .cluster.local:8090) and the right METALAKE / CATALOG values,
+#      then:  kubectl apply -f deploy/k8s/00-namespace-config.yaml
+#   2. Edit the `args:` line below to your real schema name (the
+#      placeholder __FILL_ME_SCHEMA__ will fail loudly so we never
+#      silently probe the wrong namespace).
+#   3. kubectl apply -f deploy/k8s/99-probe-gravitino-job.yaml
+#   4. kubectl -n lcp wait --for=condition=complete \
+#        job/lcp-probe-gravitino --timeout=60s
+#   5. kubectl -n lcp logs job/lcp-probe-gravitino
+#
+# Re-run:
+#   kubectl -n lcp delete job lcp-probe-gravitino   # then apply again
+# (Jobs are immutable once created; delete + re-apply is the workflow.)
+#
+# Why ttlSecondsAfterFinished=600:
+# - we want the operator to see logs after success/failure, but not
+#   leave a stale Pod around forever; ten minutes is enough to grab
+#   logs and decide the next step.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: lcp-probe-gravitino
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-probe-gravitino
+    app.kubernetes.io/component: probe
+    app.kubernetes.io/part-of: lcp
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 60
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lcp-probe-gravitino
+        app.kubernetes.io/component: probe
+        app.kubernetes.io/part-of: lcp
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: probe
+          image: lcp:dev
+          imagePullPolicy: IfNotPresent
+          command: ["python", "scripts/probe_gravitino.py"]
+          # Positional schema arg.  Replace __FILL_ME_SCHEMA__ with a
+          # real Gravitino schema (e.g. "public") that has at least one
+          # fileset under it; otherwise the probe will succeed but
+          # report "found 0 filesets", which still proves connectivity
+          # but tells us nothing about data shape.
+          #
+          # Optional: append "--fileset", "<name>" to also dump one
+          # fileset's properties for end-to-end mapping verification.
+          args:
+            - "__FILL_ME_SCHEMA__"
+          envFrom:
+            - configMapRef:
+                name: lcp-config
+            - secretRef:
+                name: lcp-secrets
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi

@@ -40,6 +40,13 @@ RUN uv export --no-dev --frozen --no-emit-project --format requirements-txt --ou
 COPY src ./src
 RUN uv pip install --system --no-cache --no-deps .
 
+# In-cluster probe script.  Only this single file from scripts/ -- the
+# rest of scripts/ is dev-only (local smoke tests, MinIO seeders) and
+# must NOT ship to k8s, otherwise an operator might `kubectl exec` and
+# accidentally run a script that targets localhost.  Whitelist, don't
+# blanket-copy.  See deploy/k8s/99-probe-gravitino-job.yaml for usage.
+COPY scripts/probe_gravitino.py ./scripts/probe_gravitino.py
+
 # Defense-in-depth: run as non-root.
 RUN useradd --create-home --uid 10001 lcp
 USER lcp
