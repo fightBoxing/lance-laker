@@ -65,6 +65,7 @@ __all__ = [
     "compact_files",
     "optimize_indices",
     "create_index",
+    "add_columns_from_func",
     "count_rows",
     "CompactionStats",
 ]
@@ -291,6 +292,47 @@ def create_index(
         "params": dict(index_params),
     }
 
+
+def add_columns_from_func(
+    uri: str,
+    *,
+    transforms: Any,
+    read_columns: list[str] | None = None,
+    storage_options: dict[str, str] | None = None,
+) -> int:
+    """Add new columns to a lance dataset via ``ds.add_columns``.
+
+    ``transforms`` is forwarded verbatim.  Lance accepts two shapes:
+
+    * ``dict[str, str]`` -- column-name -> SQL expression (cheapest;
+      executed inside lance).  Used for constant / arithmetic columns.
+    * ``callable(pa.RecordBatch) -> pa.RecordBatch`` -- batch udf
+      returning the new columns only.  Used for embedding callbacks
+      where the transform is a Python function.
+
+    We do NOT validate the shape here so a future lance version that
+    accepts e.g. a generator does not break us; the caller's contract
+    with lance is the single source of truth.
+
+    ``read_columns`` is the optional projection lance will materialise
+    before invoking the transform.  Useful for embedding: pass the
+    source columns and skip everything else.
+
+    Returns ``ds.count_rows()`` after the commit so callers can record
+    how many rows the new column ended up populating (it equals the
+    pre-call row count -- ``add_columns`` does not insert rows -- but
+    surfacing it here keeps the executor's payload honest).
+    """
+
+    ds = open_dataset(uri, storage_options=storage_options)
+    if read_columns is None:
+        ds.add_columns(transforms)
+    else:
+        ds.add_columns(transforms, read_columns=read_columns)
+    # Re-open so we observe the post-commit manifest (mirrors the
+    # delete_rows / optimize_indices pattern in this module).
+    ds_after = open_dataset(uri, storage_options=storage_options)
+    return int(ds_after.count_rows())
 
 # ---------------------------------------------------------------------------
 # Read-only helpers (used by e2e and tests)

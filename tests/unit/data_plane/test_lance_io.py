@@ -60,6 +60,7 @@ class _FakeDataset:
     deleted_predicates: list[str] = field(default_factory=list)
     create_index_calls: list[dict[str, Any]] = field(default_factory=list)
     listed_indices: list[Any] = field(default_factory=list)
+    add_columns_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.optimize = _FakeOptimize()
@@ -77,6 +78,18 @@ class _FakeDataset:
 
     def list_indices(self) -> list[Any]:
         return list(self.listed_indices)
+
+    def add_columns(
+        self,
+        transforms: Any,
+        read_columns: list[str] | None = None,
+    ) -> None:
+        # Capture both positional and keyword forms; the production
+        # wrapper only sends ``read_columns`` when not None, so we
+        # record a small dict that makes both paths obvious in tests.
+        self.add_columns_calls.append(
+            {"transforms": transforms, "read_columns": read_columns},
+        )
 
 
 class _FakeLance:
@@ -344,6 +357,69 @@ class TestCreateIndex:
         )
         ds = fake_lance._cache["s3://b/t.lance"]
         assert ds.create_index_calls[0]["replace"] is True
+
+
+# ---------------------------------------------------------------------------
+# add_columns_from_func
+# ---------------------------------------------------------------------------
+
+
+class TestAddColumnsFromFunc:
+
+    def test_dict_transform_forwarded_without_read_columns(
+        self, fake_lance: _FakeLance,
+    ) -> None:
+        # Dict transforms are SQL-expression columns; lance does not need
+        # an input projection so we send only the transforms positional.
+        rows_after = lance_io.add_columns_from_func(
+            "s3://b/t.lance",
+            transforms={"score": "id * 2"},
+            storage_options={"e": "x"},
+        )
+        ds = fake_lance._cache["s3://b/t.lance"]
+        assert ds.add_columns_calls == [
+            {"transforms": {"score": "id * 2"}, "read_columns": None},
+        ]
+        # rows_after equals the fake's seeded row count (no insert).
+        assert rows_after == 5
+
+    def test_callable_transform_with_read_columns(
+        self, fake_lance: _FakeLance,
+    ) -> None:
+        # Callable + read_columns is the embedding shape: lance materialises
+        # only ``source_cols`` into each batch and the udf returns the new
+        # vector column.
+        def fake_udf(_batch: Any) -> Any:
+            return _batch  # we only assert the call shape, not data
+
+        rows_after = lance_io.add_columns_from_func(
+            "s3://b/t.lance",
+            transforms=fake_udf,
+            read_columns=["title", "body"],
+            storage_options={"e": "x"},
+        )
+        ds = fake_lance._cache["s3://b/t.lance"]
+        assert len(ds.add_columns_calls) == 1
+        call = ds.add_columns_calls[0]
+        assert call["transforms"] is fake_udf
+        assert call["read_columns"] == ["title", "body"]
+        assert rows_after == 5
+
+    def test_returns_post_commit_row_count(
+        self, fake_lance: _FakeLance,
+    ) -> None:
+        # Pre-seed a dataset whose ``count_rows`` differs from the default
+        # to confirm the wrapper actually re-reads via open_dataset, not a
+        # cached pre-call value.
+        ds_uri = "s3://b/t.lance"
+        ds_obj = _FakeDataset(uri=ds_uri, rows=42)
+        fake_lance._cache[ds_uri] = ds_obj
+        rows_after = lance_io.add_columns_from_func(
+            ds_uri,
+            transforms={"k": "1"},
+            storage_options={"e": "x"},
+        )
+        assert rows_after == 42
 
 
 # ---------------------------------------------------------------------------
