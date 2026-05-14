@@ -1,0 +1,26 @@
+{
+  "last_heartbeat": "2026-05-14T06:12:23.654Z",
+  "engine_status": "running",
+  "execution_log": [
+    {
+      "task_id": "project-suggestions",
+      "status": "success",
+      "timestamp": "2026-05-14T02:52:25.607Z",
+      "duration_ms": 92841
+    },
+    {
+      "task_id": "project-suggestions",
+      "status": "success",
+      "timestamp": "2026-05-14T02:53:14.801Z",
+      "duration_ms": 49185
+    },
+    {
+      "task_id": "anatomy-rescan",
+      "status": "success",
+      "timestamp": "2026-05-14T04:00:01.246Z",
+      "duration_ms": 335
+    }
+  ],
+  "dead_letter_queue": [],
+  "upcoming": []
+}

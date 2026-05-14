@@ -23,6 +23,7 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -742,6 +743,219 @@ class TestLanceLoop:
         # Must not raise; NULL row gets a vector built from "".
         out_batch = transform(in_batch)
         assert out_batch.num_rows == 3
+
+
+# ---------------------------------------------------------------------------
+# β.3: auto-index-build
+# ---------------------------------------------------------------------------
+
+
+class TestAutoIndexBuild:
+    """β.3: EmbeddingExecutor auto-submits INDEX_BUILD when configured."""
+
+    async def test_no_index_config_returns_none(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        """Without index_config in extra, no index is created."""
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session, dataset_uuid=ds.dataset_uuid, extra=None,
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        assert result.payload["index_build_submitted"] is None
+
+    async def test_auto_build_false_returns_none(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        """auto_build=false means no index is created."""
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            extra={"index_config": {"auto_build": False}},
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        assert result.payload["index_build_submitted"] is None
+
+    async def test_auto_build_creates_index_and_task(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        """Happy path: auto_build=true inserts Index + Task rows."""
+
+        from lcp.db.models import Index, Task as TaskModel
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            extra={
+                "index_config": {
+                    "auto_build": True,
+                    "index_type": "IVF_PQ",
+                    "params": {"num_partitions": 32},
+                },
+            },
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        await session.commit()
+
+        assert result.payload["index_build_submitted"] is True
+
+        # Verify Index row was created.
+        idx_stmt = select(Index).where(
+            Index.dataset_uuid == ds.dataset_uuid,
+            Index.index_name == "idx_embedding",
+        )
+        idx = (await session.execute(idx_stmt)).scalar_one()
+        assert idx.status == "BUILDING"
+        assert idx.column_name == "embedding"
+        assert idx.index_type == "IVF_PQ"
+
+        # Verify INDEX_BUILD task was created.
+        task_stmt = select(TaskModel).where(
+            TaskModel.task_type == "INDEX_BUILD",
+            TaskModel.dataset_uuid == ds.dataset_uuid,
+        )
+        build_task = (await session.execute(task_stmt)).scalar_one()
+        assert build_task.status == "PENDING"
+        assert build_task.params["index_name"] == "idx_embedding"
+        assert build_task.params["column_name"] == "embedding"
+        assert build_task.params["params"] == {"num_partitions": 32}
+
+    async def test_auto_build_custom_index_name(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        """User-specified index_name is honoured."""
+
+        from lcp.db.models import Index
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            extra={
+                "index_config": {
+                    "auto_build": True,
+                    "index_name": "my_custom_idx",
+                },
+            },
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        await session.commit()
+
+        assert result.payload["index_build_submitted"] is True
+        idx_stmt = select(Index).where(
+            Index.dataset_uuid == ds.dataset_uuid,
+            Index.index_name == "my_custom_idx",
+        )
+        idx = (await session.execute(idx_stmt)).scalar_one()
+        assert idx.column_name == "embedding"
+
+    async def test_auto_build_skips_existing_index(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        """If the index already exists, skip (idempotent)."""
+
+        from lcp.db.models import Index
+
+        ds = await _make_dataset(session)
+        # Pre-seed an existing index.
+        existing_idx = Index(
+            dataset_uuid=ds.dataset_uuid,
+            index_name="idx_embedding",
+            column_name="embedding",
+            index_type="IVF_PQ",
+            status="READY",
+        )
+        session.add(existing_idx)
+        await session.commit()
+
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            extra={"index_config": {"auto_build": True}},
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        assert result.payload["index_build_submitted"] is False
+
+    async def test_auto_build_error_does_not_fail_vectorization(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If index creation fails, vectorization still succeeds."""
+
+        from lcp.db.models import Index
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            extra={"index_config": {"auto_build": True}},
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+
+        # Make the Index query blow up to simulate a DB error.
+        original_execute = session.execute
+
+        async def _boom_on_index_select(stmt, *args, **kwargs):
+            # Only blow up on the Index select inside
+            # _maybe_submit_index_build.
+            stmt_str = str(stmt)
+            if "vector_index" in stmt_str and "idx_embedding" not in stmt_str:
+                raise RuntimeError("simulated DB failure")
+            return await original_execute(stmt, *args, **kwargs)
+
+        monkeypatch.setattr(session, "execute", _boom_on_index_select)
+
+        # Should NOT raise -- vectorization succeeds despite index error.
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        # index_build_submitted is None (error swallowed).
+        assert result.payload["index_build_submitted"] is None
+        # But vectorization payload is still complete.
+        assert result.payload["vector_count"] == 5
 
 
 # ---------------------------------------------------------------------------

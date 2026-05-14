@@ -82,6 +82,8 @@ Failure modes
 from __future__ import annotations
 
 import asyncio
+import logging
+import uuid
 from typing import Any
 
 from sqlalchemy import select
@@ -89,13 +91,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lcp.core.config import get_settings
 from lcp.data_plane import lance_io
-from lcp.db.models import Dataset, Task, VectorizationRule
+from lcp.db.models import Dataset, Index, Task, VectorizationRule
 from lcp.embeddings import hash_embedding, st_embedding
 from lcp.workers.executors.base import (
     ExecutorResult,
     LifecycleExecutor,
     utcnow_naive,
 )
+
+_logger = logging.getLogger(__name__)
 
 # Reserved ``model_name`` value that bypasses the real-model path and
 # uses the deterministic hash mock instead.  Kept as a literal (not an
@@ -114,6 +118,13 @@ _DEFAULT_CONCAT_SEPARATOR: str = " "
 # Single source of truth so a future REST schema change can promote
 # this field to a first-class column without grepping for the literal.
 _EXTRA_KEY_CONCAT_SEPARATOR: str = "concat_separator"
+
+# Key under ``rule.extra`` for the auto-index-build configuration.
+# Structure: {"auto_build": true, "index_name": ..., "index_type": ..., "params": ...}
+_EXTRA_KEY_INDEX_CONFIG: str = "index_config"
+
+# Default index type when not specified in index_config.
+_DEFAULT_INDEX_TYPE: str = "IVF_PQ"
 
 
 def _build_batch_transform(
@@ -352,6 +363,18 @@ class EmbeddingExecutor(LifecycleExecutor):
 
         now = utcnow_naive()
 
+        # β.3: best-effort auto-index-build.  If the rule carries an
+        # index_config with auto_build=true, we insert an Index row +
+        # INDEX_BUILD task into the session so the worker's outer
+        # commit picks them up.  Failures here are logged but never
+        # propagate -- the vectorization itself already succeeded.
+        index_build_submitted = await _maybe_submit_index_build(
+            session,
+            dataset=dataset,
+            target_column=rule.target_column,
+            extra=extra,
+        )
+
         return ExecutorResult(
             payload={
                 "executor": "EmbeddingExecutor",
@@ -370,6 +393,105 @@ class EmbeddingExecutor(LifecycleExecutor):
                 "batch_size": rule.batch_size,
                 "vector_dim": vector_dim,
                 "vector_count": int(rows_after),
+                "index_build_submitted": index_build_submitted,
                 "executed_at": now.isoformat(),
             },
         )
+
+
+# ---------------------------------------------------------------------------
+# β.3: auto-index-build helper
+# ---------------------------------------------------------------------------
+
+
+async def _maybe_submit_index_build(
+    session: AsyncSession,
+    *,
+    dataset: Dataset,
+    target_column: str,
+    extra: dict[str, Any],
+) -> bool | None:
+    """Best-effort: insert Index + INDEX_BUILD Task if configured.
+
+    Returns:
+        ``True``  -- index build task was submitted.
+        ``False`` -- index already exists (idempotent skip).
+        ``None``  -- no ``index_config`` or ``auto_build`` is falsy.
+
+    Never raises: any unexpected error is logged and swallowed so the
+    vectorization result is not lost.
+    """
+
+    index_config = extra.get(_EXTRA_KEY_INDEX_CONFIG)
+    if not index_config or not index_config.get("auto_build"):
+        return None
+
+    try:
+        index_name: str = index_config.get(
+            "index_name", f"idx_{target_column}",
+        )
+        index_type: str = index_config.get("index_type", _DEFAULT_INDEX_TYPE)
+        index_params: dict[str, Any] = index_config.get("params") or {}
+
+        # Idempotent: skip if the index already exists (any status).
+        stmt = select(Index).where(
+            Index.dataset_uuid == dataset.dataset_uuid,
+            Index.index_name == index_name,
+        )
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        if existing is not None:
+            _logger.info(
+                "β.3 auto-index: index %r already exists (status=%s), skipping",
+                index_name,
+                existing.status,
+            )
+            return False
+
+        # Insert the Index row in BUILDING state.
+        idx = Index(
+            dataset_uuid=dataset.dataset_uuid,
+            index_name=index_name,
+            column_name=target_column,
+            index_type=index_type,
+            params=index_params or None,
+            status="BUILDING",
+        )
+        session.add(idx)
+        await session.flush()  # get idx.id for the idempotency key
+
+        # Insert the INDEX_BUILD task so a worker picks it up.
+        task = Task(
+            task_uuid=str(uuid.uuid4()),
+            task_type="INDEX_BUILD",
+            dataset_uuid=dataset.dataset_uuid,
+            tenant_id=dataset.tenant_id,
+            status="PENDING",
+            priority=5,
+            params={
+                "index_name": index_name,
+                "column_name": target_column,
+                "index_type": index_type,
+                "params": index_params,
+            },
+            idempotency_key=f"auto_build:{dataset.dataset_uuid}/{index_name}:{idx.id}",
+            max_attempts=3,
+        )
+        session.add(task)
+        await session.flush()
+
+        _logger.info(
+            "β.3 auto-index: submitted INDEX_BUILD task %s for index %r",
+            task.task_uuid,
+            index_name,
+        )
+        return True
+
+    except Exception:
+        _logger.warning(
+            "β.3 auto-index: failed to submit INDEX_BUILD for %s/%s, "
+            "vectorization result is preserved",
+            dataset.dataset_uuid,
+            target_column,
+            exc_info=True,
+        )
+        return None
