@@ -30,13 +30,13 @@ index; the worker flips the row to ``READY`` once lance succeeds.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Index
 from lcp.services import dataset_service, task_service
 
@@ -72,10 +72,7 @@ _MERGEABLE_STATES: frozenset[str] = frozenset({"READY"})
 _TERMINAL_STATES: frozenset[str] = frozenset({"DROPPED"})
 
 
-def _utcnow() -> datetime:
-    """Return naive UTC ``datetime`` matching the DATETIME(3) column type."""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` is imported from ``lcp.core.time`` (shared utility).
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +178,9 @@ async def list_indexes(
         await session.execute(base.order_by(Index.created_at.desc()))
     ).scalars().all()
 
-    count_stmt: Select[Any] = select(func.count(Index.id)).where(
-        Index.dataset_uuid == dataset_uuid,
-    )
-    total = (await session.execute(count_stmt)).scalar_one()
-    return items, int(total)
+    # No pagination: a single dataset rarely hosts hundreds of indexes;
+    # ``len(items)`` avoids an extra DB round-trip for COUNT.
+    return items, len(items)
 
 
 async def drop_index(
@@ -225,7 +220,7 @@ async def optimize_index(
             f"{sorted(_OPTIMIZABLE_STATES)} states allow optimize",
         )
     obj.status = "OPTIMIZING"
-    obj.last_optimized_at = _utcnow()
+    obj.last_optimized_at = utcnow_naive()
     await session.commit()
     await session.refresh(obj)
 
@@ -262,7 +257,7 @@ async def merge_index(
             f"{sorted(_MERGEABLE_STATES)} states allow merge",
         )
     obj.status = "MERGING"
-    obj.last_merged_at = _utcnow()
+    obj.last_merged_at = utcnow_naive()
     await session.commit()
     await session.refresh(obj)
     return obj

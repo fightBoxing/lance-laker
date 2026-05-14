@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import Select, func, select
@@ -27,6 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lcp.core.tenant import require_current_tenant
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Task
 
 # ---------------------------------------------------------------------------
@@ -59,12 +59,7 @@ class TaskTransitionError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _utcnow() -> datetime:
-    """Return naive UTC ``datetime`` (matches the DATETIME(3) column type)."""
-
-    # The DDL stores naive timestamps; strip tzinfo to keep equality checks
-    # working in tests that compare against ``datetime.utcnow()``.
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` is imported from ``lcp.core.time`` (shared utility).
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +142,27 @@ async def get_task(session: AsyncSession, task_uuid: str) -> Task:
     return obj
 
 
+def _apply_task_filters(
+    stmt: Select[Any],
+    *,
+    dataset_uuid: str | None = None,
+    task_type: str | None = None,
+    status: str | None = None,
+) -> Select[Any]:
+    """Append optional WHERE predicates shared by list and count queries.
+
+    Extracted so the two queries stay in sync when filters are added.
+    """
+
+    if dataset_uuid is not None:
+        stmt = stmt.where(Task.dataset_uuid == dataset_uuid)
+    if task_type is not None:
+        stmt = stmt.where(Task.task_type == task_type)
+    if status is not None:
+        stmt = stmt.where(Task.status == status)
+    return stmt
+
+
 async def list_tasks(
     session: AsyncSession,
     *,
@@ -165,27 +181,16 @@ async def list_tasks(
     if page_size > 200:
         page_size = 200
 
-    base = select(Task)
-    if dataset_uuid is not None:
-        base = base.where(Task.dataset_uuid == dataset_uuid)
-    if task_type is not None:
-        base = base.where(Task.task_type == task_type)
-    if status is not None:
-        base = base.where(Task.status == status)
+    filters = dict(dataset_uuid=dataset_uuid, task_type=task_type, status=status)
 
     # Direct count off the Task table so the RLS hook can match the leaf and
     # inject ``tenant_id``; wrapping in a subquery would hide the table name.
-    count_stmt: Select[Any] = select(func.count(Task.id))
-    if dataset_uuid is not None:
-        count_stmt = count_stmt.where(Task.dataset_uuid == dataset_uuid)
-    if task_type is not None:
-        count_stmt = count_stmt.where(Task.task_type == task_type)
-    if status is not None:
-        count_stmt = count_stmt.where(Task.status == status)
+    count_stmt = _apply_task_filters(select(func.count(Task.id)), **filters)
     total = (await session.execute(count_stmt)).scalar_one()
 
     items_stmt = (
-        base.order_by(Task.created_at.desc())
+        _apply_task_filters(select(Task), **filters)
+        .order_by(Task.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -209,7 +214,7 @@ async def cancel_task(session: AsyncSession, task_uuid: str) -> Task:
             f"task {task_uuid} is in terminal state {obj.status!r} and cannot be cancelled",
         )
     obj.status = "CANCELLED"
-    obj.finished_at = _utcnow()
+    obj.finished_at = utcnow_naive()
     await session.commit()
     await session.refresh(obj)
     return obj

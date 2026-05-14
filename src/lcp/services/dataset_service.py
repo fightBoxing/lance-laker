@@ -82,6 +82,24 @@ async def get_dataset(session: AsyncSession, dataset_uuid: str) -> Dataset:
     return obj
 
 
+def _apply_dataset_filters(
+    stmt: Select[Any],
+    *,
+    catalog: str | None = None,
+    db_schema: str | None = None,
+) -> Select[Any]:
+    """Append optional WHERE predicates shared by list and count queries.
+
+    Extracted so the two queries stay in sync when filters are added.
+    """
+
+    if catalog is not None:
+        stmt = stmt.where(Dataset.catalog == catalog)
+    if db_schema is not None:
+        stmt = stmt.where(Dataset.db_schema == db_schema)
+    return stmt
+
+
 async def list_datasets(
     session: AsyncSession,
     *,
@@ -102,26 +120,21 @@ async def list_datasets(
     if page_size > 200:
         page_size = 200
 
-    base = select(Dataset)
-    if catalog is not None:
-        base = base.where(Dataset.catalog == catalog)
-    if db_schema is not None:
-        base = base.where(Dataset.db_schema == db_schema)
-
     # Count via a direct ``SELECT count(*) FROM dataset`` so the RLS hook can
     # match the ``dataset`` leaf and inject the tenant filter.  Wrapping
-    # ``base`` in ``base.subquery()`` would hide the table name behind an
-    # anonymous alias and the predicate would silently be skipped, allowing
-    # cross-tenant count leakage.
-    count_stmt: Select[Any] = select(func.count(Dataset.id))
-    if catalog is not None:
-        count_stmt = count_stmt.where(Dataset.catalog == catalog)
-    if db_schema is not None:
-        count_stmt = count_stmt.where(Dataset.db_schema == db_schema)
+    # in a subquery would hide the table name behind an anonymous alias and
+    # the predicate would silently be skipped, allowing cross-tenant count
+    # leakage.
+    count_stmt = _apply_dataset_filters(
+        select(func.count(Dataset.id)), catalog=catalog, db_schema=db_schema,
+    )
     total = (await session.execute(count_stmt)).scalar_one()
 
     items_stmt = (
-        base.order_by(Dataset.created_at.desc())
+        _apply_dataset_filters(
+            select(Dataset), catalog=catalog, db_schema=db_schema,
+        )
+        .order_by(Dataset.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )

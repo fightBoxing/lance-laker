@@ -21,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -109,11 +109,9 @@ async def list_policies(
         await session.execute(base.order_by(LifecyclePolicy.created_at.desc()))
     ).scalars().all()
 
-    count_stmt: Select[Any] = select(func.count(LifecyclePolicy.id)).where(
-        LifecyclePolicy.dataset_uuid == dataset_uuid,
-    )
-    total = (await session.execute(count_stmt)).scalar_one()
-    return items, int(total)
+    # No pagination: policies per dataset are few; ``len(items)`` avoids
+    # an extra DB round-trip for COUNT.
+    return items, len(items)
 
 
 async def update_policy(

@@ -34,14 +34,15 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import Select, and_, or_, select, update
+from sqlalchemy import Select, and_, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lcp.core.tenant import get_current_tenant
+from lcp.core.tenant import NotSystemPrincipalError, require_system_context
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Task, WorkerRegistry
 
 # ---------------------------------------------------------------------------
@@ -74,8 +75,12 @@ _DEAD = "DEAD"
 # ---------------------------------------------------------------------------
 
 
-class SchedulerNotSystemError(Exception):
-    """Raised when scheduler primitives run without a system principal."""
+class SchedulerNotSystemError(NotSystemPrincipalError):
+    """Raised when scheduler primitives run without a system principal.
+
+    Subclasses :class:`lcp.core.tenant.NotSystemPrincipalError` so callers
+    can catch either the specific or generic form.
+    """
 
 
 class WorkerNotFoundError(Exception):
@@ -100,20 +105,19 @@ class TaskTransitionError(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _utcnow() -> datetime:
-    """Return naive UTC datetime that matches the DATETIME(3) columns."""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` and ``require_system_context`` are imported from
+# ``lcp.core.time`` and ``lcp.core.tenant`` respectively.
 
 
 def _require_system() -> None:
-    """Refuse to run unless the caller bound a system principal."""
+    """Wrap :func:`require_system_context` to raise the scheduler-specific type."""
 
-    principal = get_current_tenant()
-    if principal is None or not getattr(principal, "is_system", False):
+    try:
+        require_system_context("scheduler primitives")
+    except NotSystemPrincipalError:
         raise SchedulerNotSystemError(
             "scheduler primitives must run under with_system_context()",
-        )
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,7 @@ async def register_worker(
     host: str | None = None,
     capacity: int = 1,
     labels: dict[str, Any] | None = None,
+    _retry_count: int = 0,
 ) -> WorkerRegistry:
     """Insert or refresh a worker row; rotates ``lease_id`` on every call.
 
@@ -141,7 +146,7 @@ async def register_worker(
     _require_system()
 
     new_lease = str(uuid.uuid4())
-    now = _utcnow()
+    now = utcnow_naive()
 
     stmt: Select[Any] = select(WorkerRegistry).where(
         WorkerRegistry.worker_id == worker_id,
@@ -176,8 +181,11 @@ async def register_worker(
         await session.flush()
     except IntegrityError:
         # Race against another process registering the same worker_id;
-        # rollback and re-issue as an upsert.
+        # rollback and re-issue as an upsert.  Limit retries to prevent
+        # infinite recursion if the error is persistent (e.g. schema issue).
         await session.rollback()
+        if _retry_count >= 2:
+            raise
         return await register_worker(
             session,
             worker_id=worker_id,
@@ -185,6 +193,7 @@ async def register_worker(
             host=host,
             capacity=capacity,
             labels=labels,
+            _retry_count=_retry_count + 1,
         )
     await session.commit()
     await session.refresh(obj)
@@ -211,7 +220,7 @@ async def heartbeat(
         raise WorkerLeaseMismatchError(
             f"worker {worker_id!r} lease mismatch (expected {obj.lease_id!r})",
         )
-    obj.last_heartbeat_at = _utcnow()
+    obj.last_heartbeat_at = utcnow_naive()
     if obj.status == _DEAD:
         # A worker reviving itself before the reaper got to it -- accept and
         # mark ALIVE again; tasks it lost are already back in PENDING.
@@ -304,7 +313,7 @@ async def claim_next_task(
 
     # Move to RUNNING under the same transaction so the row lock guarantees
     # at-most-once dispatch.
-    now = _utcnow()
+    now = utcnow_naive()
     task.status = _RUNNING
     task.worker_id = worker_id
     task.started_at = now
@@ -343,7 +352,7 @@ async def complete_task(
             f"task {task_uuid} is in state {task.status!r}; expected RUNNING",
         )
     task.status = _SUCCEEDED
-    task.finished_at = _utcnow()
+    task.finished_at = utcnow_naive()
     task.result = result
     task.error_code = None
     task.error_message = None
@@ -381,7 +390,7 @@ async def fail_task(
             f"task {task_uuid} is in state {task.status!r}; expected RUNNING",
         )
     task.status = _FAILED
-    task.finished_at = _utcnow()
+    task.finished_at = utcnow_naive()
     task.error_code = error_code
     task.error_message = error_message
 
@@ -410,7 +419,7 @@ async def reap_dead_workers(
 
     _require_system()
 
-    cutoff = _utcnow() - timeout
+    cutoff = utcnow_naive() - timeout
 
     # 1) Find candidates: ALIVE / DRAINING workers whose last heartbeat
     #    predates the cutoff.  DEAD workers are skipped (already reaped).
@@ -476,11 +485,22 @@ async def _get_task(session: AsyncSession, task_uuid: str) -> Task:
 
 
 async def _decrement_in_flight(session: AsyncSession, worker_id: str) -> None:
-    """Atomically decrement ``in_flight`` (clamped at zero)."""
+    """Atomically decrement ``in_flight`` (clamped at zero).
+
+    Uses ``GREATEST(0, in_flight - 1)`` so a double-decrement (e.g.
+    reaper resets ``in_flight`` to 0 while a complete/fail is in flight)
+    never drives the counter negative — a negative ``in_flight`` would
+    fool ``claim_next_task`` into handing out unlimited work.
+    """
 
     await session.execute(
         update(WorkerRegistry)
         .where(WorkerRegistry.worker_id == worker_id)
-        .values(in_flight=WorkerRegistry.in_flight - 1)
+        .values(
+            in_flight=case(
+                (WorkerRegistry.in_flight > 0, WorkerRegistry.in_flight - 1),
+                else_=0,
+            ),
+        )
         .execution_options(synchronize_session=False),
     )

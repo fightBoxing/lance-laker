@@ -57,14 +57,15 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Select, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lcp.core.tenant import get_current_tenant
+from lcp.core.tenant import NotSystemPrincipalError, require_system_context
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Dataset, LifecyclePolicy, Task
 
 # ---------------------------------------------------------------------------
@@ -82,8 +83,12 @@ TASK_INDEX_OPTIMIZE = "INDEX_OPTIMIZE"
 # ---------------------------------------------------------------------------
 
 
-class PlannerNotSystemError(Exception):
-    """Raised when planner primitives run without a system principal."""
+class PlannerNotSystemError(NotSystemPrincipalError):
+    """Raised when planner primitives run without a system principal.
+
+    Subclasses :class:`lcp.core.tenant.NotSystemPrincipalError` so callers
+    can catch either the specific or generic form.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -109,20 +114,18 @@ class PlannerTick:
 # ---------------------------------------------------------------------------
 
 
-def _utcnow() -> datetime:
-    """Return naive UTC datetime that matches the DATETIME(3) columns."""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` is imported from ``lcp.core.time``.
 
 
 def _require_system() -> None:
-    """Refuse to run unless the caller bound a system principal."""
+    """Wrap :func:`require_system_context` to raise the planner-specific type."""
 
-    principal = get_current_tenant()
-    if principal is None or not getattr(principal, "is_system", False):
+    try:
+        require_system_context("lifecycle planner")
+    except NotSystemPrincipalError:
         raise PlannerNotSystemError(
             "lifecycle planner must run under with_system_context()",
-        )
+        ) from None
 
 
 def _day_bucket(now: datetime) -> str:
@@ -174,7 +177,7 @@ async def plan_once(
 
     _require_system()
     if now is None:
-        now = _utcnow()
+        now = utcnow_naive()
 
     policies = await _fetch_enabled_policies(session)
     emitted: list[str] = []

@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Dataset, Task
 
 __all__ = [
@@ -81,10 +81,9 @@ class LifecycleExecutor(ABC):
 # ---------------------------------------------------------------------------
 
 
-def utcnow_naive() -> datetime:
-    """Return naive UTC -- matches the DDL ``DATETIME(3)`` columns."""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` is imported from ``lcp.core.time`` and re-exported here
+# so existing executor imports (``from .base import utcnow_naive``) keep
+# working without changes.
 
 
 # ---------------------------------------------------------------------------

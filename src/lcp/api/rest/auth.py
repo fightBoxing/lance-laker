@@ -12,6 +12,7 @@ propagation.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+import json
 from typing import Any
 
 from fastapi import HTTPException, status
@@ -58,15 +59,18 @@ ASGIApp = Callable[[ASGIScope, ASGIReceive, ASGISend], Awaitable[None]]
 def _is_public(path: str) -> bool:
     """Return True if ``path`` should bypass authentication."""
 
-    return any(path == p or path.startswith(p + "/") or path == p for p in _PUBLIC_PREFIXES)
+    return any(path == p or path.startswith(p + "/") for p in _PUBLIC_PREFIXES)
 
 
 async def _send_401(send: ASGISend, detail: str) -> None:
-    """Emit a minimal 401 response over ASGI."""
+    """Emit a minimal 401 response over ASGI.
 
-    body = (
-        b'{"detail":"' + detail.replace('"', "'").encode("utf-8") + b'"}'
-    )
+    Uses :func:`json.dumps` instead of hand-crafted string interpolation
+    so that special characters (quotes, backslashes, newlines) in
+    ``detail`` cannot produce malformed JSON.
+    """
+
+    body = json.dumps({"detail": detail}).encode("utf-8")
     await send(
         {
             "type": "http.response.start",

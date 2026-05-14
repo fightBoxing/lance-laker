@@ -119,3 +119,27 @@ def with_system_context(subject: str = "scheduler") -> _SystemContext:
     """Convenience factory: ``with with_system_context(): ...``."""
 
     return _SystemContext(subject)
+
+
+# ---------------------------------------------------------------------------
+# System principal guard
+# ---------------------------------------------------------------------------
+
+
+class NotSystemPrincipalError(PermissionError):
+    """Raised when system-only code runs without ``is_system=True``."""
+
+
+def require_system_context(caller: str = "system operation") -> None:
+    """Refuse to proceed unless the current principal is a system principal.
+
+    Scheduler and planner primitives use this to enforce the invariant
+    that cross-tenant operations are only legal under
+    :func:`with_system_context`.
+    """
+
+    principal = _current_tenant.get()
+    if principal is None or not getattr(principal, "is_system", False):
+        raise NotSystemPrincipalError(
+            f"{caller} must run under with_system_context()",
+        )
