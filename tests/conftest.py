@@ -26,18 +26,20 @@ def _reset_lru_caches() -> Iterator[None]:
     """Clear all module-level caches between tests for isolation."""
 
     from lcp.core.config import get_settings
-    from lcp.core.security import reset_jwks_cache_for_tests
+    from lcp.core.security import reset_jti_denylist_for_tests, reset_jwks_cache_for_tests
     from lcp.core.tenant import _current_tenant
     from lcp.db.session import get_engine, get_session_factory
 
     get_settings.cache_clear()
     reset_jwks_cache_for_tests()
+    reset_jti_denylist_for_tests()
     _current_tenant.set(None)  # belt-and-braces: drop any leaked principal
     get_engine.cache_clear()
     get_session_factory.cache_clear()
     yield
     get_settings.cache_clear()
     reset_jwks_cache_for_tests()
+    reset_jti_denylist_for_tests()
     get_engine.cache_clear()
     get_session_factory.cache_clear()
 

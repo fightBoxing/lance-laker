@@ -75,7 +75,14 @@ def _find_rls_targets(stmt: ClauseElement) -> list[Any]:
 
     roots: list[Any] = []
     if isinstance(stmt, Select):
-        roots = list(stmt.get_final_froms())
+        # P-5 fast-path: SELECT without a FROM clause (e.g. ``SELECT 1``,
+        # ``SELECT current_timestamp``) cannot reference any tenant-bearing
+        # table.  Skip ``get_final_froms()`` entirely to avoid the cost of
+        # statement introspection on every such statement.
+        froms = stmt.get_final_froms()
+        if not froms:
+            return []
+        roots = list(froms)
     elif isinstance(stmt, (Update, Delete)):
         target = getattr(stmt, "table", None)
         if target is not None:

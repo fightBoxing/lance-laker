@@ -27,12 +27,15 @@ def _build_context(
     *,
     cn: bytes | str | None = b"worker-1",
     org: bytes | str | None = b"tenant-acme",
+    uri_sans: list[bytes | str] | None = None,
 ) -> Any:
     auth: dict[str, list[Any]] = {}
     if cn is not None:
         auth["x509_common_name"] = [cn]
     if org is not None:
         auth["x509_organization"] = [org]
+    if uri_sans is not None:
+        auth["x509_uri"] = uri_sans
     ctx = MagicMock()
     ctx.auth_context.return_value = auth
     return ctx
@@ -72,6 +75,44 @@ class TestResolvePrincipal:
         ctx = _build_context(cn=b"worker-4", org=None)
         with pytest.raises(AuthenticationError):
             _resolve_principal(ctx)
+
+    # H-3: SPIFFE URI SAN takes priority over O= and CN=
+
+    def test_spiffe_uri_san_wins_over_org(self) -> None:
+        """H-3: SPIFFE URI SAN tenant_id takes priority over O=."""
+
+        from lcp.api.grpc.server import _resolve_principal
+        ctx = _build_context(
+            cn=b"worker-1",
+            org=b"tenant-from-org",  # would give "tenant-from-org"
+            uri_sans=[b"spiffe://lance/tenant/spiffe-tenant/worker/w-7"],
+        )
+        principal = _resolve_principal(ctx)
+        assert principal.tenant_id == "spiffe-tenant"
+
+    def test_spiffe_uri_san_as_string(self) -> None:
+        """H-3: string URI SAN (not bytes) is also handled."""
+
+        from lcp.api.grpc.server import _resolve_principal
+        ctx = _build_context(
+            cn="worker-1",
+            org=None,
+            uri_sans=["spiffe://trust.example/tenant/acme-corp/worker/w-1"],
+        )
+        principal = _resolve_principal(ctx)
+        assert principal.tenant_id == "acme-corp"
+
+    def test_non_spiffe_uri_falls_through_to_org(self) -> None:
+        """H-3: non-SPIFFE URI SANs are ignored; O= is used as fallback."""
+
+        from lcp.api.grpc.server import _resolve_principal
+        ctx = _build_context(
+            cn=b"worker-1",
+            org=b"org-tenant",
+            uri_sans=[b"https://service.example/identity"],
+        )
+        principal = _resolve_principal(ctx)
+        assert principal.tenant_id == "org-tenant"
 
 
 # ---------------------------------------------------------------------------

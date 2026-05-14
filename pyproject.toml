@@ -30,7 +30,7 @@ dependencies = [
     "pymysql>=1.1.0",
 
     # Security
-    "python-jose[cryptography]>=3.3.0",
+    "pyjwt[crypto]>=2.8.0",
     "httpx>=0.27.0",
 
     # Misc
@@ -94,7 +94,6 @@ markers = [
 ]
 filterwarnings = [
     "error",
-    "ignore::DeprecationWarning:jose.*",
     "ignore::DeprecationWarning:passlib.*",
     "ignore::DeprecationWarning:google.*",
     "ignore::PendingDeprecationWarning",
