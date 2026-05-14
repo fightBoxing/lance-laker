@@ -32,6 +32,8 @@ schema bump does not break us.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any
@@ -39,6 +41,7 @@ from typing import Any
 import httpx
 
 from lcp.core.config import Settings, get_settings
+from lcp.observability import GRAVITINO_REQUEST_DURATION, time_block
 
 # ---------------------------------------------------------------------------
 # Public exception hierarchy
@@ -237,12 +240,13 @@ class GravitinoClient:
         instead of hitting a 404 later from inside ``list_filesets``.
         """
 
-        path = f"/api/metalakes/{self._metalake}/catalogs/{self._catalog}"
-        payload = await self._get_json(path)
-        # Gravitino returns ``{"code": 0, "catalog": {...}}``; tolerate flat shape too.
-        body = payload.get("catalog") if "catalog" in payload else payload
-        name = body.get("name") if isinstance(body, dict) else None
-        return str(name) if name else self._catalog
+        async with self._observe("ping"):
+            path = f"/api/metalakes/{self._metalake}/catalogs/{self._catalog}"
+            payload = await self._get_json(path)
+            # Gravitino returns ``{"code": 0, "catalog": {...}}``; tolerate flat shape too.
+            body = payload.get("catalog") if "catalog" in payload else payload
+            name = body.get("name") if isinstance(body, dict) else None
+            return str(name) if name else self._catalog
 
     async def list_filesets(self, schema: str) -> list[str]:
         """Return fileset *names* under ``{metalake}/{catalog}/{schema}``.
@@ -252,21 +256,23 @@ class GravitinoClient:
         properties.  This split mirrors how the upstream Java SDK is used.
         """
 
-        path = self._fileset_collection_path(schema)
-        payload = await self._get_json(path)
-        # Response shape: ``{"identifiers": [{"namespace": [...], "name": "x"}, ...]}``.
-        identifiers = payload.get("identifiers") or []
-        return [str(item["name"]) for item in identifiers if "name" in item]
+        async with self._observe("list_filesets"):
+            path = self._fileset_collection_path(schema)
+            payload = await self._get_json(path)
+            # Response shape: ``{"identifiers": [{"namespace": [...], "name": "x"}, ...]}``.
+            identifiers = payload.get("identifiers") or []
+            return [str(item["name"]) for item in identifiers if "name" in item]
 
     async def get_fileset(self, schema: str, name: str) -> Fileset:
         """Fetch a single fileset; raises :class:`GravitinoNotFoundError` on 404."""
 
-        path = f"{self._fileset_collection_path(schema)}/{name}"
-        payload = await self._get_json(path)
-        # Gravitino wraps the actual entity under ``"fileset"``.  Tolerate
-        # either shape so a future flat response does not break us.
-        body = payload.get("fileset") if "fileset" in payload else payload
-        return Fileset.from_payload(body)
+        async with self._observe("get_fileset"):
+            path = f"{self._fileset_collection_path(schema)}/{name}"
+            payload = await self._get_json(path)
+            # Gravitino wraps the actual entity under ``"fileset"``.  Tolerate
+            # either shape so a future flat response does not break us.
+            body = payload.get("fileset") if "fileset" in payload else payload
+            return Fileset.from_payload(body)
 
     async def set_fileset_properties(
         self,
@@ -286,18 +292,60 @@ class GravitinoClient:
         if not properties:
             raise GravitinoError("set_fileset_properties called with empty dict")
 
-        path = f"{self._fileset_collection_path(schema)}/{name}"
-        body = {
-            "updates": [
-                {"@type": "setProperty", "property": key, "value": value}
-                for key, value in properties.items()
-            ],
-        }
-        payload = await self._put_json(path, body)
-        entity = payload.get("fileset") if "fileset" in payload else payload
-        return Fileset.from_payload(entity)
+        async with self._observe("set_fileset_properties"):
+            path = f"{self._fileset_collection_path(schema)}/{name}"
+            body = {
+                "updates": [
+                    {"@type": "setProperty", "property": key, "value": value}
+                    for key, value in properties.items()
+                ],
+            }
+            payload = await self._put_json(path, body)
+            entity = payload.get("fileset") if "fileset" in payload else payload
+            return Fileset.from_payload(entity)
 
     # ------- internals ---------------------------------------------------
+
+    @asynccontextmanager
+    async def _observe(self, op: str) -> AsyncIterator[None]:
+        """Time one HTTP round-trip and label it by ``op`` + result class.
+
+        ``result`` buckets:
+            ``success``    -- 2xx body parsed without error.
+            ``not_found``  -- 404 (informational, not a failure for callers
+                              that probe-then-create).
+            ``auth``       -- 401 / 403, distinct from generic error so
+                              dashboards can spot stale tokens.
+            ``error``      -- 5xx, transport error, or invalid JSON.
+
+        Why a context manager rather than a decorator: keeps the call
+        sites visually obvious (``async with`` block scopes the work)
+        and lets us observe both the duration and the result class
+        without adding a kwarg / try-except to every public method.
+        """
+
+        with time_block() as elapsed:
+            try:
+                yield
+            except GravitinoNotFoundError:
+                GRAVITINO_REQUEST_DURATION().labels(
+                    op=op, result="not_found",
+                ).observe(elapsed[0])
+                raise
+            except GravitinoAuthError:
+                GRAVITINO_REQUEST_DURATION().labels(
+                    op=op, result="auth",
+                ).observe(elapsed[0])
+                raise
+            except GravitinoError:
+                GRAVITINO_REQUEST_DURATION().labels(
+                    op=op, result="error",
+                ).observe(elapsed[0])
+                raise
+            else:
+                GRAVITINO_REQUEST_DURATION().labels(
+                    op=op, result="success",
+                ).observe(elapsed[0])
 
     def _fileset_collection_path(self, schema: str) -> str:
         return (

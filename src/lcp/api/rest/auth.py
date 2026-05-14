@@ -39,10 +39,17 @@ oauth2_scheme = OAuth2PasswordBearer(
 # Path prefixes that bypass authentication.  ``startswith`` matching is used
 # so that the Swagger UI assets under ``/docs/swagger-ui-bundle.js`` etc. are
 # also reachable without a token.
+#
+# ``/metrics`` is on this list because Prometheus scrape targets
+# present no Bearer token; the metric output itself contains no
+# tenant data (only counter / histogram aggregates), so anonymous
+# scrape is the standard pattern.  Restricting access is a Service /
+# NetworkPolicy concern, not an application concern.
 _PUBLIC_PREFIXES: tuple[str, ...] = (
     "/healthz",
     "/livez",
     "/readyz",
+    "/metrics",
     "/openapi.json",
     "/docs",
     "/redoc",

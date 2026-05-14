@@ -1,0 +1,76 @@
+---
+# Native Prometheus scrape configuration snippet.
+#
+# Use this when the cluster does NOT have the Prometheus Operator
+# installed.  Append the ``scrape_configs:`` entries to your existing
+# ``prometheus.yml`` (typically delivered via a ConfigMap mounted at
+# ``/etc/prometheus/prometheus.yml``) and reload Prometheus
+# (``curl -X POST http://prometheus:9090/-/reload``).
+#
+# Stored as a Kubernetes ConfigMap purely for distribution -- it is
+# NOT directly mountable into vanilla Prometheus; an operator must
+# splice the content into the actual prometheus.yml.  Keeping it in
+# YAML lets ``kubectl apply -f`` ship it alongside the rest of
+# deploy/k8s.
+#
+# Why two scrape jobs (annotations + label-selector):
+#   - The annotation-based job auto-discovers any pod that opts in via
+#     ``prometheus.io/scrape: "true"`` -- this is what the
+#     deployments under deploy/k8s/{10,20,40} already declare.  It is
+#     the "no extra config per workload" path.
+#   - The label-selector job (commented out by default) is what you
+#     enable if you want a stricter allow-list and to drop the
+#     reliance on annotations.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lcp-prometheus-scrape-config
+  namespace: lcp
+  labels:
+    app.kubernetes.io/part-of: lcp
+data:
+  lcp-scrape.snippet.yaml: |
+    # Append to scrape_configs: in prometheus.yml.
+    - job_name: 'lcp-pods'
+      kubernetes_sd_configs:
+        - role: pod
+          namespaces:
+            names:
+              - lcp
+      relabel_configs:
+        # Honour the prometheus.io/scrape annotation we set on every
+        # LCP pod template.
+        - source_labels:
+            - __meta_kubernetes_pod_annotation_prometheus_io_scrape
+          action: keep
+          regex: "true"
+        # Use prometheus.io/path if set, default /metrics otherwise.
+        - source_labels:
+            - __meta_kubernetes_pod_annotation_prometheus_io_path
+          action: replace
+          target_label: __metrics_path__
+          regex: "(.+)"
+        # Use prometheus.io/port if set, default the existing port.
+        - source_labels:
+            - __address__
+            - __meta_kubernetes_pod_annotation_prometheus_io_port
+          action: replace
+          regex: ([^:]+)(?::\d+)?;(\d+)
+          replacement: $1:$2
+          target_label: __address__
+        # Surface useful labels in the scraped time-series so dashboards
+        # can group by component / pod without re-fetching.
+        - source_labels:
+            - __meta_kubernetes_namespace
+          target_label: namespace
+        - source_labels:
+            - __meta_kubernetes_pod_name
+          target_label: pod
+        - source_labels:
+            - __meta_kubernetes_pod_label_app_kubernetes_io_component
+          target_label: component
+        - source_labels:
+            - __meta_kubernetes_pod_label_app_kubernetes_io_name
+          target_label: workload
+      scrape_interval: 30s
+      scrape_timeout: 10s

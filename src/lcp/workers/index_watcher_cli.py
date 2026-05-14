@@ -49,6 +49,14 @@ from sqlalchemy.ext.asyncio import (
 from lcp.core.config import get_settings
 from lcp.core.tenant import with_system_context
 from lcp.db.rls import install_rls_listener
+from lcp.observability import (
+    WATCHER_INDEXES_SCANNED,
+    WATCHER_PASS_DURATION,
+    WATCHER_PASS_TOTAL,
+    WATCHER_TASKS_ENQUEUED,
+    start_metrics_server,
+    time_block,
+)
 from lcp.services.index_watcher_service import (
     WatchPassReport,
     run_watch_pass,
@@ -127,6 +135,12 @@ async def _run(args: argparse.Namespace) -> int:
     install_rls_listener(engine.sync_engine)
     factory = async_sessionmaker(engine, expire_on_commit=False)
 
+    # Start the Prometheus exporter once, before the loop.  The HTTP
+    # server runs on a background thread (see start_metrics_server
+    # docstring); failures bind-side log and we proceed without
+    # metrics rather than crash-loop the daemon.
+    start_metrics_server("watcher")
+
     shutdown = asyncio.Event()
     _install_signal_handlers(shutdown)
 
@@ -135,15 +149,18 @@ async def _run(args: argparse.Namespace) -> int:
         with with_system_context():
             while not shutdown.is_set():
                 try:
-                    async with factory() as session:
-                        report = await run_watch_pass(
-                            session, settings=settings,
-                        )
+                    with time_block() as elapsed:
+                        async with factory() as session:
+                            report = await run_watch_pass(
+                                session, settings=settings,
+                            )
+                    _record_pass_metrics(report, elapsed[0], result="success")
                     _log_report(report)
                 except Exception:  # noqa: BLE001 -- never exit on tick err
                     # Per the docstring: a failing pass logs and we keep
                     # going.  Engine-level errors (e.g. pool exhausted)
                     # land here too; the next pass usually recovers.
+                    WATCHER_PASS_TOTAL().labels(result="error").inc()
                     _LOGGER.exception("watcher pass failed; continuing")
 
                 iteration += 1
@@ -184,6 +201,27 @@ def _log_report(report: WatchPassReport) -> None:
         report.skipped_open_failed,
         report.skipped_idempotent,
     )
+
+
+def _record_pass_metrics(
+    report: WatchPassReport, elapsed_seconds: float, *, result: str,
+) -> None:
+    """Translate one pass outcome into Prometheus observations.
+
+    Why we increment the scanned / enqueued counters by the pass-level
+    deltas instead of incrementing inside the service:
+        Keeping observation at the CLI layer means the service stays
+        unaware of the metric registry, which lets watcher-service
+        unit tests run without registering metrics, and makes the call
+        sites discoverable from one place.
+    """
+
+    WATCHER_PASS_TOTAL().labels(result=result).inc()
+    WATCHER_PASS_DURATION().observe(elapsed_seconds)
+    if report.scanned_indexes:
+        WATCHER_INDEXES_SCANNED().inc(report.scanned_indexes)
+    if report.enqueued_tasks:
+        WATCHER_TASKS_ENQUEUED().inc(report.enqueued_tasks)
 
 
 def _install_signal_handlers(shutdown: asyncio.Event) -> None:

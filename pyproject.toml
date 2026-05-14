@@ -36,6 +36,16 @@ dependencies = [
     # Misc
     "python-multipart>=0.0.9",
     "structlog>=24.1.0",
+
+    # Observability (P1-7 Monitor v0).  prometheus_client is an
+    # in-process metric registry + WSGI/ASGI exporter; we use it to
+    # expose /metrics from the REST API and a standalone HTTP server
+    # from long-running worker daemons (watcher).  Short-lived
+    # CronJobs (planner / meta-sync) intentionally do not export
+    # metrics yet -- they would need a Pushgateway, which is out of
+    # scope for v0; their success/failure remains observable via
+    # k8s job_status + structured logs.
+    "prometheus-client>=0.20.0",
 ]
 
 [project.optional-dependencies]

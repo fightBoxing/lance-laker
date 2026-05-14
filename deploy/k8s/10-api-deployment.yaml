@@ -24,6 +24,14 @@ spec:
         app.kubernetes.io/name: lcp-api
         app.kubernetes.io/component: api
         app.kubernetes.io/part-of: lcp
+      # Prometheus scrape annotations -- /metrics rides on the same
+      # 8080/http port as the application API (see
+      # src/lcp/api/rest/main.py); the OIDC middleware whitelists
+      # /metrics so anonymous scrape works.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: api

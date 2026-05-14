@@ -49,6 +49,12 @@ from sqlalchemy.ext.asyncio import (
 from lcp.core.config import get_settings
 from lcp.core.tenant import with_system_context
 from lcp.db.rls import install_rls_listener
+from lcp.observability import (
+    TASK_DURATION,
+    TASK_FINISHED,
+    start_metrics_server,
+    time_block,
+)
 from lcp.services import scheduler_service
 from lcp.workers.lifecycle_executors import build_default_registry
 from lcp.workers.lifecycle_worker_service import (
@@ -143,6 +149,11 @@ async def _run(args: argparse.Namespace) -> int:
     shutdown = asyncio.Event()
     _install_signal_handlers(shutdown)
 
+    # Start the Prometheus exporter once, before the loop.  Same
+    # rationale as the watcher CLI: long-running daemon, pull-mode
+    # scrape, EADDRINUSE is logged and tolerated.
+    start_metrics_server("worker")
+
     iteration = 0
     try:
         with with_system_context():
@@ -168,11 +179,13 @@ async def _run(args: argparse.Namespace) -> int:
             # 2. Drain loop.
             while not shutdown.is_set():
                 async with factory() as session:
-                    outcome = await run_iteration(
-                        session,
-                        config=config,
-                        registry=registry,
-                    )
+                    with time_block() as elapsed:
+                        outcome = await run_iteration(
+                            session,
+                            config=config,
+                            registry=registry,
+                        )
+                _record_outcome_metrics(outcome, elapsed[0])
                 _log_outcome(outcome)
 
                 iteration += 1
@@ -216,6 +229,29 @@ def _log_outcome(outcome: TickOutcome) -> None:
             "task %s (%s) -> FAILED (%s)",
             outcome.task_uuid, outcome.task_type, outcome.error,
         )
+
+
+def _record_outcome_metrics(
+    outcome: TickOutcome, elapsed_seconds: float,
+) -> None:
+    """Translate one tick outcome into Prometheus observations.
+
+    Idle ticks (``claimed=False``) are not counted as task runs --
+    they would dilute lcp_task_finished_total with empty pulls and
+    make the success-rate alert meaningless.  Idle frequency is
+    inferable from ``lcp_task_duration_seconds_count``-on-rate when
+    we need it later.
+    """
+
+    if not outcome.claimed:
+        return
+    # outcome.task_type is None only for the dataset-missing path; we
+    # still want to count those, so coerce to a sentinel rather than
+    # drop the data point.
+    task_type = outcome.task_type or "UNKNOWN"
+    result = outcome.final_status or "UNKNOWN"
+    TASK_FINISHED().labels(type=task_type, result=result).inc()
+    TASK_DURATION().labels(type=task_type).observe(elapsed_seconds)
 
 
 def _install_signal_handlers(shutdown: asyncio.Event) -> None:

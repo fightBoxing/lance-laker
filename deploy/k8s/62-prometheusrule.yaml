@@ -1,0 +1,120 @@
+---
+# PrometheusRule -- recording + alerting rules for the LCP control plane.
+#
+# This resource depends on the kube-prometheus-stack / Prometheus
+# Operator CRDs.  Without the Operator: copy the ``groups:`` block
+# below into a file referenced by ``rule_files:`` in your
+# prometheus.yml.
+#
+# Why we keep alerts deliberately conservative:
+#   v0 Monitor only has four signals (watcher pass, executor task,
+#   gravitino client, build_info).  An alert that pages on a single
+#   missed metric will burn out the operator before we have enough
+#   ground-truth to tune thresholds.  We declare *recording rules*
+#   for the dashboards and one *info-level* alert per signal so
+#   pages are opt-in.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: lcp-monitor-v0
+  namespace: lcp
+  labels:
+    app.kubernetes.io/part-of: lcp
+    release: prometheus
+spec:
+  groups:
+    - name: lcp-recording
+      interval: 30s
+      rules:
+        # Watcher pass success rate over the last 5 minutes.  Use rate
+        # not increase so it survives Prometheus restarts.
+        - record: lcp:watcher_pass_success_rate_5m
+          expr: |
+            sum by (workload) (rate(lcp_watcher_pass_total{result="success"}[5m]))
+            /
+            clamp_min(sum by (workload) (rate(lcp_watcher_pass_total[5m])), 0.001)
+
+        # p95 watcher pass duration -- catches "watcher is healthy but
+        # very slow".
+        - record: lcp:watcher_pass_duration_seconds:p95_5m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, workload) (rate(lcp_watcher_pass_duration_seconds_bucket[5m]))
+            )
+
+        # Executor success rate by task type.
+        - record: lcp:task_success_rate_5m
+          expr: |
+            sum by (type) (rate(lcp_task_finished_total{result="SUCCEEDED"}[5m]))
+            /
+            clamp_min(sum by (type) (rate(lcp_task_finished_total[5m])), 0.001)
+
+        # p95 executor duration by task type.
+        - record: lcp:task_duration_seconds:p95_5m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, type) (rate(lcp_task_duration_seconds_bucket[5m]))
+            )
+
+        # p95 gravitino client RTT by op.
+        - record: lcp:gravitino_request_duration_seconds:p95_5m
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le, op) (rate(lcp_gravitino_request_duration_seconds_bucket[5m]))
+            )
+
+    - name: lcp-alerts
+      rules:
+        # info-level: catches the "watcher dead" failure mode where no
+        # pass has completed in 5 minutes.  Threshold is loose; tighten
+        # once we have a baseline.
+        - alert: LCPWatcherStalled
+          expr: |
+            absent_over_time(lcp_watcher_pass_total[5m]) == 1
+          for: 5m
+          labels:
+            severity: info
+            component: lcp-watcher
+          annotations:
+            summary: "LCP index watcher has not completed a pass in 5 minutes"
+            description: |
+              No ``lcp_watcher_pass_total`` samples received in the last
+              5 minutes.  The watcher pod may be crash-looping or stuck
+              in a tick.  Check ``kubectl logs deploy/lcp-index-watcher``.
+
+        # Worker / executor: high failure ratio for the past 10 min.
+        - alert: LCPTaskFailureRatioHigh
+          expr: |
+            (
+              sum by (type) (rate(lcp_task_finished_total{result="FAILED"}[10m]))
+              /
+              clamp_min(sum by (type) (rate(lcp_task_finished_total[10m])), 0.001)
+            ) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+            component: lcp-worker
+          annotations:
+            summary: "LCP {{ $labels.type }} tasks failing > 50% over 10m"
+            description: |
+              More than half of recent ``{{ $labels.type }}`` tasks
+              ended in FAILED.  Inspect the executor logs and the
+              ``task`` table for the failing rows.
+
+        # Gravitino: any sustained 401/403 should be visible.
+        - alert: LCPGravitinoAuthFailures
+          expr: |
+            sum(rate(lcp_gravitino_request_duration_seconds_count{result="auth"}[10m])) > 0.05
+          for: 10m
+          labels:
+            severity: warning
+            component: lcp-gravitino-client
+          annotations:
+            summary: "LCP Gravitino client receiving 401/403"
+            description: |
+              The Gravitino client is seeing sustained auth failures.
+              Check ``LCP_GRAVITINO_TOKEN`` and the operator's
+              fileset-write permissions.

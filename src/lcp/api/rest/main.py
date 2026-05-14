@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, status
+from fastapi import FastAPI, Response, status
 from fastapi.responses import JSONResponse
 
 from lcp import __version__
@@ -21,6 +21,11 @@ from lcp.api.rest.routers import (
 from lcp.core.config import get_settings
 from lcp.db.rls import install_rls_listener
 from lcp.db.session import get_engine
+from lcp.observability import (
+    CONTENT_TYPE_LATEST,
+    render_latest,
+    set_build_component,
+)
 
 
 @asynccontextmanager
@@ -34,6 +39,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
 
     del app  # unused
+    # Stamp the build-info gauge with our component label.  Idempotent
+    # across restarts; safe even when create_app() runs multiple times
+    # in tests because set_build_component() removes the placeholder
+    # series first.
+    set_build_component("rest_api")
     engine = get_engine()
     try:
         install_rls_listener(engine.sync_engine)
@@ -82,6 +92,22 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={"status": "ready"},
+        )
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics() -> Response:
+        """Prometheus scrape endpoint.
+
+        Returns the LCP metric registry in Prometheus text-format 0.0.4.
+        Anonymous (whitelisted in :class:`OIDCAuthMiddleware`); access
+        control is the Service / NetworkPolicy layer's job, not the
+        application's.
+        """
+
+        return Response(
+            content=render_latest(),
+            media_type=CONTENT_TYPE_LATEST,
+            status_code=status.HTTP_200_OK,
         )
 
     return app

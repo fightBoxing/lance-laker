@@ -40,6 +40,15 @@ spec:
         app.kubernetes.io/name: lcp-index-watcher
         app.kubernetes.io/component: watcher
         app.kubernetes.io/part-of: lcp
+      # Prometheus scrape annotations -- match the convention used by
+      # the kube-prometheus stack's "kubernetes-pods" auto-discovery
+      # job.  ServiceMonitor users (Prometheus Operator) ignore these
+      # and rely on the labels above instead; both paths are kept so a
+      # cluster without the Operator still gets metrics.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: "/metrics"
     spec:
       # SIGTERM to drain: the CLI flips an asyncio.Event so the
       # in-flight pass commits before the kubelet sends SIGKILL.
@@ -56,6 +65,14 @@ spec:
                 name: lcp-config
             - secretRef:
                 name: lcp-secrets
+          ports:
+            # Prometheus scrape port; the CLI starts a stand-alone
+            # exporter via prometheus_client.start_http_server.
+            # Naming this "metrics" lets a ServiceMonitor reference it
+            # by port name without coupling to the integer value.
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
           resources:
             requests:
               cpu: 50m

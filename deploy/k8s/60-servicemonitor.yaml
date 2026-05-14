@@ -1,0 +1,109 @@
+---
+# Headless Services that ServiceMonitor / PodMonitor target by name.
+#
+# Why headless (clusterIP: None):
+#   ServiceMonitor selects pods through the Service's endpoints, but
+#   we do not need a stable VIP for scrape -- Prometheus dials each
+#   pod IP directly.  ClusterIP: None avoids burning an IP per
+#   exporter Service.
+#
+# Why one Service per workload instead of one shared Service:
+#   ServiceMonitor matches a single port name; mixing the worker's
+#   "metrics" (9464) and the api's "http" (8080) under one Service
+#   would force two ServiceMonitors anyway, and lose the per-workload
+#   label that Prometheus auto-attaches.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lcp-api-metrics
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-api
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: lcp
+    lcp.tencent.com/scrape: "true"
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: lcp-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lcp-worker-metrics
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-worker
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/part-of: lcp
+    lcp.tencent.com/scrape: "true"
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: lcp-worker
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lcp-index-watcher-metrics
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-index-watcher
+    app.kubernetes.io/component: watcher
+    app.kubernetes.io/part-of: lcp
+    lcp.tencent.com/scrape: "true"
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: lcp-index-watcher
+  ports:
+    - name: metrics
+      port: 9464
+      targetPort: metrics
+---
+# ServiceMonitor (Prometheus Operator).
+#
+# This resource is NO-OP if the cluster does not have the kube-prometheus
+# stack / Prometheus Operator installed -- the CRD just won't exist.
+# kubectl apply will fail loudly in that case; pair this manifest with
+# the equivalent native scrape-config in 61-prometheus-scrape-config.yaml
+# and apply only the one your cluster supports.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: lcp-services
+  namespace: lcp
+  labels:
+    app.kubernetes.io/part-of: lcp
+    # Most kube-prometheus-stack installs select ServiceMonitors by
+    # this release label; if your operator uses a different selector
+    # (e.g. ``prometheus: kube-prometheus``) edit this label rather
+    # than the operator config.
+    release: prometheus
+spec:
+  namespaceSelector:
+    matchNames:
+      - lcp
+  selector:
+    matchLabels:
+      lcp.tencent.com/scrape: "true"
+  endpoints:
+    # Every targeted Service exposes either ``http`` (api) or
+    # ``metrics`` (workers); we list both so one ServiceMonitor
+    # covers all three workloads without per-workload duplication.
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

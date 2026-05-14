@@ -24,11 +24,19 @@ spec:
         app.kubernetes.io/name: lcp-worker
         app.kubernetes.io/component: worker
         app.kubernetes.io/part-of: lcp
+      # Prometheus scrape annotations -- match the kube-prometheus
+      # "kubernetes-pods" auto-discovery convention; ServiceMonitor
+      # users (Operator) ignore these in favour of the labels above.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9464"
+        prometheus.io/path: "/metrics"
     spec:
-      # The worker has no listening port -- terminationGracePeriod gives
-      # SIGTERM enough time for the in-flight tick to drain to SUCCEEDED
-      # / FAILED before the kubelet sends SIGKILL.  See lifecycle_worker
-      # signal handler.
+      # The worker exposes a 9464 metrics port (see ports: below) but
+      # no application HTTP surface; terminationGracePeriod gives
+      # SIGTERM enough time for the in-flight tick to drain to
+      # SUCCEEDED / FAILED before the kubelet sends SIGKILL.  See
+      # lifecycle_worker signal handler.
       terminationGracePeriodSeconds: 30
       containers:
         - name: worker
@@ -45,11 +53,18 @@ spec:
                 name: lcp-config
             - secretRef:
                 name: lcp-secrets
-          # No probes: the worker is a polling daemon with no HTTP
-          # surface.  A liveness probe that exec'd a Python script on
-          # the engine would defeat its own purpose; we rely on
-          # `kubectl logs` and the worker_registry table for liveness
-          # signals.
+          ports:
+            # Prometheus scrape port; the CLI starts a stand-alone
+            # exporter via prometheus_client.start_http_server.
+            - name: metrics
+              containerPort: 9464
+              protocol: TCP
+          # No application probes: the worker is a polling daemon
+          # with no application HTTP surface.  Liveness is observable
+          # via the worker_registry table + kubectl logs.  We do not
+          # probe the metrics port either -- prometheus_client's
+          # background HTTP server is best-effort and we never want a
+          # metrics-only failure to crash-loop the worker.
           resources:
             requests:
               cpu: 50m
