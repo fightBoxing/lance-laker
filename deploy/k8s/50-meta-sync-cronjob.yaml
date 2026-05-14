@@ -1,0 +1,76 @@
+---
+# Meta-sync CronJob -- one Pod every five minutes, reconciles LCP rows
+# against Gravitino filesets and exits.
+#
+# Why CronJob and not a Deployment with a sleep loop:
+# - same reasons as the planner CronJob (deploy/k8s/30-planner-cronjob.yaml):
+#   k8s-native retry / failure history, no stale long-lived connections,
+#   per-run isolation;
+# - meta-sync is naturally idempotent, so re-runs cannot corrupt state;
+# - 5-minute cadence balances "Gravitino edits surface promptly in the
+#   LCP UI" against "do not hammer the catalog server".  Tighten the
+#   schedule (or trigger via REST) when feedback latency matters more.
+#
+# Why exit-0 even if a few datasets fail:
+# - see lcp/workers/meta_sync_cli.py module docstring; one misconfigured
+#   dataset must not crash-loop the whole CronJob.
+#
+# When LCP_GRAVITINO_URL is empty (the default in the namespace
+# ConfigMap) the CLI logs a warning and exits 0; the CronJob therefore
+# remains green in dev clusters that do not yet have Gravitino.  Set
+# the URL in 00-namespace-config.yaml to enable the feature.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lcp-meta-sync
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-meta-sync
+    app.kubernetes.io/component: meta-sync
+    app.kubernetes.io/part-of: lcp
+spec:
+  schedule: "*/5 * * * *"
+  # Don't pile up reconcile runs if one is slow; skip until the next
+  # tick.  Each run is idempotent so missing a tick is harmless.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 60
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # The CLI swallows per-dataset failures internally and returns 0,
+      # so a non-zero exit means infrastructure broke (DB unreachable,
+      # Gravitino auth wrong).  In that case we want one quick retry,
+      # then let the next 5-minute tick pick up.
+      backoffLimit: 1
+      activeDeadlineSeconds: 240
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: lcp-meta-sync
+            app.kubernetes.io/component: meta-sync
+            app.kubernetes.io/part-of: lcp
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: meta-sync
+              image: lcp:dev
+              imagePullPolicy: IfNotPresent
+              command: ["python", "-m", "lcp.workers.meta_sync_cli"]
+              # No CLI args by default == --scope=ALL --push.  Operators
+              # who want a pull-only diff can patch the args on the fly:
+              #   kubectl -n lcp patch cronjob lcp-meta-sync \
+              #     --type=json \
+              #     -p='[{"op":"add","path":"/spec/jobTemplate/spec/template/spec/containers/0/args","value":["--no-push"]}]'
+              envFrom:
+                - configMapRef:
+                    name: lcp-config
+                - secretRef:
+                    name: lcp-secrets
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  cpu: 250m
+                  memory: 256Mi

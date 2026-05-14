@@ -46,6 +46,18 @@ data:
   LCP_STORAGE_ENDPOINT_URL: "http://minio.daft-platform.svc.cluster.local:9000"
   LCP_STORAGE_BUCKET: "lcp-lance"
   LCP_STORAGE_REGION: "us-east-1"
+
+  # Gravitino integration (consumed by lcp.integrations.gravitino +
+  # the meta-sync CronJob).  Empty URL deliberately disables the
+  # feature -- in dev clusters without Gravitino, the CronJob exits 0
+  # and the REST endpoint returns 503; both are intentional fallbacks.
+  # Set this to the cluster-internal Gravitino endpoint when wiring
+  # the real catalog (e.g. http://gravitino.gravitino.svc.cluster.local:8090).
+  LCP_GRAVITINO_URL: ""
+  LCP_GRAVITINO_METALAKE: "metalake_demo"
+  LCP_GRAVITINO_CATALOG: "lance"
+  LCP_GRAVITINO_AUTH_TYPE: "none"
+  LCP_GRAVITINO_REQUEST_TIMEOUT_SECONDS: "10"
 ---
 # Secrets: MySQL password + MinIO credentials.  Created via stringData
 # (k8s base64-encodes for us) -- this is dev cluster; for prod use
