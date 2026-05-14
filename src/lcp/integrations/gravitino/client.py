@@ -168,7 +168,18 @@ class GravitinoClient:
         self._metalake = metalake
         self._catalog = catalog
 
-        headers: dict[str, str] = {"Accept": "application/json"}
+        # Why "*/*" and not "application/json":
+        # Some Gravitino REST endpoints (observed on /catalogs/{c} and
+        # /filesets/{f} in v0.6.x) return 406 Not Acceptable when the
+        # client sends "Accept: application/json", but happily serve the
+        # exact same JSON body when Accept is "*/*" or absent.  This is
+        # a Jersey/Glassfish content-negotiation quirk on the server's
+        # @Produces declarations, not something we can negotiate around
+        # by tweaking the suffix (we tried application/json;charset=utf-8
+        # and application/vnd.gravitino+json -- still 406).  Sending */*
+        # matches what curl does by default and is the documented escape
+        # hatch when a server's content negotiation is broken.
+        headers: dict[str, str] = {"Accept": "*/*"}
         if auth_type == "bearer":
             headers["Authorization"] = f"Bearer {token}"
 
