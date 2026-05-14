@@ -39,17 +39,25 @@ COPY pyproject.toml uv.lock README-skeleton.md ./
 # what is missing.
 ARG ENABLE_EMBEDDING=false
 
+# Slice 4 / B.6 (beta.2a): opt-in lance data-plane extras (pylance +
+# pyarrow).  Adds ~150 MB.  Symmetric with ENABLE_EMBEDDING: default
+# off so CI / pure-control-plane installs stay slim.  When the worker
+# must run real lance read/write paths (VECTORIZE end-to-end loop,
+# COMPACTION, INDEX_BUILD, INDEX_OPTIMIZE, TTL_DELETE), build with
+# `--build-arg ENABLE_LANCE=true`.  Without it, the affected
+# executors raise LanceNotInstalledError at the first real call so
+# operators see the missing wheel immediately.
+ARG ENABLE_LANCE=false
+
 # Install runtime deps only (NO dev extras: pytest etc. don't need to
 # ship to k8s).  Two stages so a transitive dep change cannot invalidate
-# the source layer.  When ENABLE_EMBEDDING=true, fold the [embedding]
-# extras into the same export so torch / transformers land in the same
-# layer (kept as one RUN to avoid a wasted layer when the flag is off).
-RUN if [ "$ENABLE_EMBEDDING" = "true" ]; then \
-    EXTRA_FLAG="--extra embedding"; \
-    else \
-    EXTRA_FLAG=""; \
-    fi \
-    && uv export --no-dev --frozen --no-emit-project $EXTRA_FLAG --format requirements-txt --output-file /tmp/requirements.txt \
+# the source layer.  Both ENABLE_EMBEDDING and ENABLE_LANCE fold their
+# extras into the same uv export so a single install layer covers
+# everything (avoids a wasted layer when either flag is off).
+RUN EXTRA_FLAG=""; \
+    if [ "$ENABLE_EMBEDDING" = "true" ]; then EXTRA_FLAG="$EXTRA_FLAG --extra embedding"; fi; \
+    if [ "$ENABLE_LANCE" = "true" ]; then EXTRA_FLAG="$EXTRA_FLAG --extra lance"; fi; \
+    uv export --no-dev --frozen --no-emit-project $EXTRA_FLAG --format requirements-txt --output-file /tmp/requirements.txt \
     && uv pip install --system --no-cache --requirement /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 

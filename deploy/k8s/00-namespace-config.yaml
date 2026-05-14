@@ -39,10 +39,23 @@ data:
   LCP_ENFORCE_TENANT_RLS: "false"
   LCP_APP_ENV: "dev-k8s"
 
-  # Object-storage hints -- not consumed by current code, but recorded
-  # so a `kubectl describe cm` documents the intended MinIO endpoint
-  # for the planned lance integration.  The smoke script consumes these
-  # via the same names.
+  # Lance object-storage config -- consumed by
+  # ``lcp.data_plane.lance_io.build_storage_options`` via
+  # ``Settings.lance_storage_*`` fields (pydantic-settings derives env
+  # names as ``LCP_<UPPER(field_name)>``).  Endpoint + region are not
+  # secrets so they live in this ConfigMap; the access/secret keys
+  # live in the ``lcp-secrets`` Secret below and are injected with the
+  # matching ``LCP_LANCE_STORAGE_*`` names so the same Settings field
+  # picks them up regardless of source.  Default empty endpoint =
+  # local filesystem mode (no MinIO call); set to the cluster-internal
+  # MinIO endpoint to enable the s3:// data path used by VECTORIZE
+  # (slice 4 / B.6 beta.2a) and friends.
+  LCP_LANCE_STORAGE_ENDPOINT: "http://minio.daft-platform.svc.cluster.local:9000"
+  LCP_LANCE_STORAGE_REGION: "us-east-1"
+
+  # Legacy aliases kept for descriptive ``kubectl describe cm``
+  # output -- NOT consumed by code.  Slated for removal once any
+  # external tooling that reads them is updated.
   LCP_STORAGE_ENDPOINT_URL: "http://minio.daft-platform.svc.cluster.local:9000"
   LCP_STORAGE_BUCKET: "lcp-lance"
   LCP_STORAGE_REGION: "us-east-1"
@@ -74,3 +87,12 @@ type: Opaque
 stringData:
   AWS_ACCESS_KEY_ID: "minioadmin"
   AWS_SECRET_ACCESS_KEY: "minioadmin"
+  # Same MinIO credentials, surfaced under the
+  # ``LCP_LANCE_STORAGE_*`` names that
+  # ``Settings.lance_storage_access_key`` / ``lance_storage_secret_key``
+  # actually read.  Adding them here lets pods pick the keys up via
+  # plain ``envFrom: secretRef`` -- no per-Deployment ``valueFrom``
+  # mapping needed, mirroring how the ConfigMap handles the
+  # non-secret half of the pair.
+  LCP_LANCE_STORAGE_ACCESS_KEY: "minioadmin"
+  LCP_LANCE_STORAGE_SECRET_KEY: "minioadmin"
