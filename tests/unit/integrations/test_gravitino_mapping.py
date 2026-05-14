@@ -257,3 +257,125 @@ class TestDatasetToPropertyPatch:
         ds = _make_dataset(index_coverage=Decimal("1E-4"))
         patch = dataset_to_property_patch(ds)
         assert patch[PROP_INDEX_COVERAGE] == "0.0001"
+
+
+# ---------------------------------------------------------------------------
+# LCP -> Gravitino (per-index, Step 6)
+# ---------------------------------------------------------------------------
+
+
+class TestIndexToPropertyPatch:
+    """Pure-function tests for :func:`index_to_property_patch`.
+
+    The function is small but every executor call site depends on the
+    exact key shape (``lcp.index.<name>.<suffix>``); these tests pin the
+    contract so a future refactor cannot silently move keys.
+    """
+
+    def test_keys_have_correct_namespace_and_suffixes(self) -> None:
+        from lcp.integrations.gravitino.mapping import (
+            index_property_keys,
+            index_to_property_patch,
+        )
+
+        state_key, column_key, last_key = index_property_keys("emb_idx")
+        patch = index_to_property_patch(
+            index_name="emb_idx",
+            state="READY",
+            column="vector",
+            last_optimized_at=datetime(2024, 5, 6, 7, 8, 9, tzinfo=timezone.utc),
+        )
+
+        assert state_key == "lcp.index.emb_idx.state"
+        assert column_key == "lcp.index.emb_idx.column"
+        assert last_key == "lcp.index.emb_idx.last_optimized_at"
+        assert set(patch.keys()) == {state_key, column_key, last_key}
+
+    def test_all_values_are_strings(self) -> None:
+        # Gravitino properties are ``Map<String, String>``.  Any non-string
+        # would be rejected at the wire level; pin the invariant in code.
+        from lcp.integrations.gravitino.mapping import index_to_property_patch
+
+        patch = index_to_property_patch(
+            index_name="i",
+            state="READY",
+            column="v",
+            last_optimized_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        )
+        for value in patch.values():
+            assert isinstance(value, str)
+
+    def test_none_last_optimized_at_renders_as_empty_string(self) -> None:
+        # An index in BUILDING state has never been optimized; the column
+        # is None.  Must not become the literal string ``"None"`` (which
+        # would mislead a UI that splits on truthy/falsy).
+        from lcp.integrations.gravitino.mapping import (
+            PROP_INDEX_LAST_OPTIMIZED_SUFFIX,
+            index_to_property_patch,
+        )
+
+        patch = index_to_property_patch(
+            index_name="brand_new",
+            state="BUILDING",
+            column="vector",
+            last_optimized_at=None,
+        )
+        last_key = next(
+            k for k in patch if k.endswith(PROP_INDEX_LAST_OPTIMIZED_SUFFIX)
+        )
+        assert patch[last_key] == ""
+
+    def test_naive_last_optimized_at_is_promoted_to_utc(self) -> None:
+        # SQLAlchemy gives us naive datetimes (DDL is DATETIME(3) without
+        # timezone); the helper must attach UTC so the rendered string
+        # never lies about timezone.
+        from lcp.integrations.gravitino.mapping import (
+            PROP_INDEX_LAST_OPTIMIZED_SUFFIX,
+            index_to_property_patch,
+        )
+
+        naive = datetime(2024, 7, 8, 9, 10, 11)
+        patch = index_to_property_patch(
+            index_name="i",
+            state="READY",
+            column="v",
+            last_optimized_at=naive,
+        )
+        last_key = next(
+            k for k in patch if k.endswith(PROP_INDEX_LAST_OPTIMIZED_SUFFIX)
+        )
+        # ``+00:00`` suffix is the proof tz was attached as UTC.
+        assert patch[last_key] == "2024-07-08T09:10:11+00:00"
+
+    def test_state_passes_through_verbatim(self) -> None:
+        # We don't translate LCP states (BUILDING / READY / FAILED /
+        # OPTIMIZING) into a Gravitino-side vocabulary -- they pass through
+        # unchanged so consumers see the same word both sides agree on.
+        from lcp.integrations.gravitino.mapping import (
+            PROP_INDEX_STATE_SUFFIX,
+            index_to_property_patch,
+        )
+
+        for state in ("BUILDING", "READY", "FAILED", "OPTIMIZING"):
+            patch = index_to_property_patch(
+                index_name="i",
+                state=state,
+                column="v",
+                last_optimized_at=None,
+            )
+            state_key = next(
+                k for k in patch if k.endswith(PROP_INDEX_STATE_SUFFIX)
+            )
+            assert patch[state_key] == state
+
+    def test_index_name_with_dots_is_preserved_verbatim(self) -> None:
+        # LCP allows dots in index names (rare but legal).  We do NOT
+        # escape them: the keys become ``lcp.index.foo.bar.state`` etc.
+        # That's intentional -- Gravitino properties is a flat map; if
+        # an operator names indices ambiguously they get the resulting
+        # key collision.  Pinning the behaviour so it's a conscious
+        # choice, not an accident, is the point of this test.
+        from lcp.integrations.gravitino.mapping import index_property_keys
+
+        state_key, _, _ = index_property_keys("foo.bar")
+        assert state_key == "lcp.index.foo.bar.state"

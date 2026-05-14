@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lcp.core.config import get_settings
 from lcp.data_plane import lance_io
 from lcp.db.models import Dataset, Index, Task
+from lcp.workers.executors._gravitino_push import push_index_properties
 from lcp.workers.executors.base import (
     ExecutorResult,
     LifecycleExecutor,
@@ -95,6 +96,26 @@ class IndexOptimizeExecutor(LifecycleExecutor):
             if seen_version is not None:
                 index.last_seen_version = seen_version
 
+        # Best-effort Gravitino property mirror (Step 6): one property
+        # push per promoted index.  We do these sequentially -- typical
+        # OPTIMIZE batches are 1-3 indices and the cost vs network
+        # round-tripping cost from a fan-out is not worth the extra
+        # complexity (asyncio.gather + error aggregation).  If a future
+        # workload promotes 50 indices at once, revisit.
+        property_push_count = 0
+        for index in rows:
+            pushed = await push_index_properties(
+                settings=settings,
+                schema=dataset.db_schema,
+                table=dataset.table_name,
+                index_name=index.index_name,
+                state="READY",
+                column=index.column_name,
+                last_optimized_at=now,
+            )
+            if pushed:
+                property_push_count += 1
+
         # Caller (worker) commits; this executor stays inside the worker
         # transaction so a crash before commit re-runs cleanly.
         # ``mode`` is always "real": even without lance configured, the
@@ -108,6 +129,7 @@ class IndexOptimizeExecutor(LifecycleExecutor):
             "indexes_promoted": [r.index_name for r in rows],
             "promoted_count": len(rows),
             "executed_at": now.isoformat(),
+            "gravitino_property_pushed_count": property_push_count,
         }
         if lance_index_count is not None:
             # Only present when lance was actually called; tests can

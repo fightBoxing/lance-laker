@@ -54,6 +54,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lcp.core.config import get_settings
 from lcp.data_plane import lance_io
 from lcp.db.models import Dataset, Index, Task
+from lcp.workers.executors._gravitino_push import push_index_properties
 from lcp.workers.executors.base import (
     ExecutorResult,
     LifecycleExecutor,
@@ -113,6 +114,18 @@ class IndexBuildExecutor(LifecycleExecutor):
         if not settings.lance_storage_endpoint:
             index_row.status = "READY"
             index_row.last_optimized_at = now
+            # Best-effort Gravitino mirror; never fails the task (Step 6).
+            # Stub-mode datasets still benefit -- it lets integration tests
+            # exercise the property-push wiring without lance configured.
+            pushed = await push_index_properties(
+                settings=settings,
+                schema=dataset.db_schema,
+                table=dataset.table_name,
+                index_name=index_name,
+                state="READY",
+                column=column_name,
+                last_optimized_at=now,
+            )
             return ExecutorResult(
                 payload={
                     "executor": "IndexBuildExecutor",
@@ -125,6 +138,7 @@ class IndexBuildExecutor(LifecycleExecutor):
                     "index_params": index_params,
                     "would_call": "lance.LanceDataset.create_index",
                     "executed_at": now.isoformat(),
+                    "gravitino_property_pushed": pushed,
                 },
             )
 
@@ -150,6 +164,21 @@ class IndexBuildExecutor(LifecycleExecutor):
         index_row.status = "READY"
         index_row.last_optimized_at = now
 
+        # Best-effort Gravitino property mirror (Step 6).  If this throws
+        # despite the helper swallowing GravitinoError -- e.g. an unexpected
+        # error type -- we still let the executor's exception path roll
+        # back the lance-side state-machine.  But the helper is documented
+        # to never raise; this is defence-in-depth only.
+        pushed = await push_index_properties(
+            settings=settings,
+            schema=dataset.db_schema,
+            table=dataset.table_name,
+            index_name=index_name,
+            state="READY",
+            column=column_name,
+            last_optimized_at=now,
+        )
+
         return ExecutorResult(
             payload={
                 "executor": "IndexBuildExecutor",
@@ -162,5 +191,6 @@ class IndexBuildExecutor(LifecycleExecutor):
                 "index_params": index_params,
                 "lance_descriptor": descriptor,
                 "executed_at": now.isoformat(),
+                "gravitino_property_pushed": pushed,
             },
         )

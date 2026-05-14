@@ -63,6 +63,24 @@ PROP_INDEX_COVERAGE = LCP_PROPERTY_PREFIX + "index_coverage"
 PROP_LATEST_VERSION = LCP_PROPERTY_PREFIX + "latest_version"
 PROP_SYNCED_AT = LCP_PROPERTY_PREFIX + "synced_at"
 
+# Index-level property keys (Step 6).  Each ANN index on a dataset surfaces
+# its own ``state`` / ``column`` / ``last_optimized_at`` triplet under the
+# nested ``lcp.index.<index_name>.*`` namespace so the Gravitino UI can
+# render per-index status without LCP shipping its own catalog API.
+#
+# We deliberately keep this triplet minimal:
+# - state: BUILDING/READY/FAILED is the only value an operator must see.
+# - column: enough for the UI to render "which column does this index back?"
+#   without joining LCP's index table.
+# - last_optimized_at: lets ops detect stale indices at a glance.
+# We don't ship ``index_type`` (it's static + already in LCP's index row)
+# or ``coverage`` (LCP doesn't currently track per-index coverage; emitting
+# a placeholder would lie to the UI -- karpathy rule: don't fabricate).
+INDEX_PROPERTY_INFIX = "index."
+PROP_INDEX_STATE_SUFFIX = ".state"
+PROP_INDEX_COLUMN_SUFFIX = ".column"
+PROP_INDEX_LAST_OPTIMIZED_SUFFIX = ".last_optimized_at"
+
 
 # ---------------------------------------------------------------------------
 # Result types (lightweight; no pydantic to keep mapping pure)
@@ -185,6 +203,70 @@ def dataset_to_property_patch(
 # ---------------------------------------------------------------------------
 
 
+def index_property_keys(index_name: str) -> tuple[str, str, str]:
+    """Return ``(state_key, column_key, last_optimized_at_key)`` for ``index_name``.
+
+    Centralised so executors and tests never hand-build the dotted keys
+    and accidentally drift; one definition, one place to change.
+    """
+
+    base = LCP_PROPERTY_PREFIX + INDEX_PROPERTY_INFIX + index_name
+    return (
+        base + PROP_INDEX_STATE_SUFFIX,
+        base + PROP_INDEX_COLUMN_SUFFIX,
+        base + PROP_INDEX_LAST_OPTIMIZED_SUFFIX,
+    )
+
+
+def index_to_property_patch(
+    *,
+    index_name: str,
+    state: str,
+    column: str,
+    last_optimized_at: datetime | None,
+) -> dict[str, str]:
+    """Render a single index's operational state as a Gravitino property patch.
+
+    Why a function (not a method on ``Index``):
+        Same reason :func:`dataset_to_property_patch` is a free function --
+        keeps it trivially unit-testable without an ORM session.
+
+    ``state`` is the LCP vocabulary verbatim (``BUILDING`` / ``READY`` /
+    ``FAILED`` / ``OPTIMIZING``), uppercased; we don't translate to a
+    Gravitino-specific spelling because the consumer (Gravitino UI) treats
+    these as opaque strings anyway.
+
+    ``last_optimized_at`` is rendered as ISO-8601 in UTC.  When the index
+    has never been optimized (i.e. row was just inserted in BUILDING)
+    the column is ``None`` and we emit an empty string -- ``properties``
+    is ``Map<String,String>`` on the wire so we cannot send ``null``.
+    Empty string is the agreed "absent" sentinel because the Gravitino
+    server happily round-trips it.
+    """
+
+    state_key, column_key, last_key = index_property_keys(index_name)
+    return {
+        state_key: state,
+        column_key: column,
+        last_key: _format_iso_utc(last_optimized_at),
+    }
+
+
+def _format_iso_utc(value: datetime | None) -> str:
+    """Render ``value`` as ISO-8601 UTC, or empty string for ``None``.
+
+    SQLAlchemy stores ``last_optimized_at`` as naive UTC (matches DDL
+    DATETIME(3)); we attach the UTC tz before isoformat so downstream
+    readers can tell it's not local time.
+    """
+
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
 def _format_decimal(value: Decimal | float | int | None) -> str:
     """Format ``value`` as a fixed-point string Gravitino can display.
 
@@ -208,10 +290,14 @@ def _format_decimal(value: Decimal | float | int | None) -> str:
 # (e.g. ``lcp.index.<name>.state``) and need the prefix to namespace cleanly.
 __all__: list[str] = [
     "DatasetPatch",
+    "INDEX_PROPERTY_INFIX",
     "LCP_PROPERTY_PREFIX",
     "PROP_DATASET_UUID",
     "PROP_FRAGMENT_COUNT",
+    "PROP_INDEX_COLUMN_SUFFIX",
     "PROP_INDEX_COVERAGE",
+    "PROP_INDEX_LAST_OPTIMIZED_SUFFIX",
+    "PROP_INDEX_STATE_SUFFIX",
     "PROP_LATEST_VERSION",
     "PROP_ROW_COUNT",
     "PROP_STATUS",
@@ -219,6 +305,8 @@ __all__: list[str] = [
     "PROP_TENANT_ID",
     "dataset_to_property_patch",
     "fileset_to_dataset_patch",
+    "index_property_keys",
+    "index_to_property_patch",
 ]
 
 # We intentionally do NOT mark the helper ``_format_decimal`` as importable;
