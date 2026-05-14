@@ -68,6 +68,18 @@ class Settings(BaseSettings):
         description="SQLAlchemy async DSN",
     )
     db_pool_size: int = 10
+    # Max overflow connections beyond pool_size.  Under burst write load
+    # (e.g. many concurrent compaction triggers) the pool saturates quickly
+    # at its base size; allowing overflow lets those requests through without
+    # queuing.  Total max open connections = db_pool_size + db_max_overflow.
+    db_max_overflow: int = Field(
+        default=20,
+        description=(
+            "SQLAlchemy max_overflow: extra connections allowed beyond "
+            "db_pool_size before requests queue.  Only applies to pooled "
+            "dialects (MySQL/PostgreSQL); ignored for SQLite."
+        ),
+    )
     db_pool_recycle_seconds: int = 3600
 
     # -- Multi-tenant --------------------------------------------------------

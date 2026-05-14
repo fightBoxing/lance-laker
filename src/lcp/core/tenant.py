@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,7 @@ class TenantPrincipal:
 
     tenant_id: str
     subject: str
-    auth_method: str  # "oidc" | "mtls" | "system"
+    auth_method: Literal["oidc", "mtls", "system"]
     is_system: bool = False
 
 

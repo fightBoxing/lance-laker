@@ -39,6 +39,7 @@ def get_engine() -> AsyncEngine:
         kwargs: dict[str, object] = {"future": True, "echo": False}
         if not settings.db_dsn.startswith("sqlite"):
             kwargs["pool_size"] = settings.db_pool_size
+            kwargs["max_overflow"] = settings.db_max_overflow
             kwargs["pool_recycle"] = settings.db_pool_recycle_seconds
         elif ":memory:" in settings.db_dsn:
             # ``:memory:`` databases are scoped to a single connection, so the
