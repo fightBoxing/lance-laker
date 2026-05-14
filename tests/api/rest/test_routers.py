@@ -913,42 +913,125 @@ class TestVectorizationRouter:
 
 class TestMetaRouter:
 
-    async def test_trigger_meta_sync_returns_501(
+    async def test_trigger_meta_sync_503_when_gravitino_unconfigured(
         self,
         http_client: Any,
         issue_token: Any,
     ) -> None:
+        # Default test settings leave LCP_GRAVITINO_URL empty, so the
+        # handler must refuse the request loudly instead of attempting
+        # a connection to a URL that does not exist.
         token = issue_token(tenant_id="t-meta")
         resp = await http_client.post(
             "/v1/meta/sync",
             headers=_auth(token),
-            json={"dry_run": True},
+            json={"scope": "ALL"},
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 503
+        assert resp.json()["detail"]["code"] == "GRAVITINO_NOT_CONFIGURED"
 
-    async def test_get_meta_sync_status_returns_501(
+    async def test_trigger_meta_sync_runs_when_configured(
+        self,
+        http_client: Any,
+        issue_token: Any,
+        monkeypatch: Any,
+    ) -> None:
+        # Point the client at a fake URL and patch the underlying
+        # GravitinoClient so the handler reconciles 0 datasets and
+        # returns a clean SUCCEEDED report.  This is a router-level
+        # integration check; service-level paths are covered exhaustively
+        # in tests/unit/services/test_meta_sync_service.py.
+        from lcp.api.rest.routers import meta as meta_router
+
+        monkeypatch.setenv(
+            "LCP_GRAVITINO_URL", "http://gravitino.test:8090",
+        )
+        # Bust the cached settings so the new env var is read.
+        from lcp.core.config import get_settings
+        get_settings.cache_clear()
+
+        # Replace GravitinoClient.from_settings with a stub that yields
+        # a no-op async context manager; the handler's reconcile_all
+        # then sees zero datasets and returns immediately.
+        class _NullClient:
+            async def __aenter__(self) -> "_NullClient":
+                return self
+
+            async def __aexit__(self, *_args: Any) -> None:
+                return None
+
+        monkeypatch.setattr(
+            meta_router.GravitinoClient,
+            "from_settings",
+            classmethod(lambda cls, settings=None: _NullClient()),
+        )
+
+        token = issue_token(tenant_id="t-meta-ok")
+        resp = await http_client.post(
+            "/v1/meta/sync",
+            headers=_auth(token),
+            json={"scope": "ALL"},
+        )
+
+        assert resp.status_code == 202
+        body = resp.json()
+        assert body["status"] == "SUCCEEDED"
+        assert body["scanned"] == 0
+        assert body["sync_id"] == "sync-inline"
+
+    async def test_trigger_meta_sync_rejects_catalog_scope(
+        self,
+        http_client: Any,
+        issue_token: Any,
+        monkeypatch: Any,
+    ) -> None:
+        # CATALOG is reserved in the OpenAPI but not implemented; the
+        # router refuses with 400 instead of silently downgrading.
+        monkeypatch.setenv(
+            "LCP_GRAVITINO_URL", "http://gravitino.test:8090",
+        )
+        from lcp.core.config import get_settings
+        get_settings.cache_clear()
+
+        token = issue_token(tenant_id="t-meta-catalog")
+        resp = await http_client.post(
+            "/v1/meta/sync",
+            headers=_auth(token),
+            json={"scope": "CATALOG"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["code"] == "SCOPE_NOT_SUPPORTED"
+
+    async def test_get_meta_sync_status_still_returns_501(
         self,
         http_client: Any,
         issue_token: Any,
     ) -> None:
+        # Async run-id storage is not yet implemented; assert the
+        # handler emits the documented machine-readable code so clients
+        # can switch behaviour when the feature lands.
         token = issue_token(tenant_id="t-meta-status")
         resp = await http_client.get(
             "/v1/meta/sync/run-1",
             headers=_auth(token),
         )
         assert resp.status_code == 501
+        assert resp.json()["detail"]["code"] == "ASYNC_RUNS_NOT_IMPLEMENTED"
 
-    async def test_get_dataset_snapshot_returns_501(
+    async def test_get_dataset_snapshot_returns_404_when_unknown(
         self,
         http_client: Any,
         issue_token: Any,
     ) -> None:
+        # Snapshot endpoint now actually queries the dataset; verifying
+        # the 404 path is enough for router coverage (the happy path
+        # exercises the same RLS lookup as the datasets router).
         token = issue_token(tenant_id="t-meta-snap")
         resp = await http_client.get(
-            "/v1/meta/datasets/d-1/snapshot",
+            "/v1/meta/datasets/does-not-exist/snapshot",
             headers=_auth(token),
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 404
 
 
 # ---------------------------------------------------------------------------

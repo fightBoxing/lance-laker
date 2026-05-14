@@ -14,11 +14,21 @@ from lcp.integrations.gravitino.client import (
     GravitinoError,
     GravitinoNotFoundError,
 )
+from lcp.integrations.gravitino.mapping import (
+    LCP_PROPERTY_PREFIX,
+    DatasetPatch,
+    dataset_to_property_patch,
+    fileset_to_dataset_patch,
+)
 
 __all__ = [
+    "LCP_PROPERTY_PREFIX",
+    "DatasetPatch",
     "Fileset",
     "GravitinoAuthError",
     "GravitinoClient",
     "GravitinoError",
     "GravitinoNotFoundError",
+    "dataset_to_property_patch",
+    "fileset_to_dataset_patch",
 ]
