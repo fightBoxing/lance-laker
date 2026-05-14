@@ -67,7 +67,7 @@ async def main() -> int:
             payload=RuleCreateRequest.model_validate({
                 "target_column": "v",
                 "source_columns": ["title"],
-                "model_name": "mock",
+                "model_name": "sentence-transformers/all-MiniLM-L6-v2",
                 "model_version": "1",
             }),
         )
@@ -108,7 +108,13 @@ async def main() -> int:
 
     # ---- step 6: wait for worker to drain ------------------------------
     _step(6, "poll task until terminal (worker should pick it up)")
-    deadline = time.time() + 60
+    # 180s instead of 60s: the real-model path (slice 4) downloads the
+    # sentence-transformers model from the Hugging Face hub on first run
+    # (~90 MB for MiniLM-L6-v2) before encode() can return.  Subsequent
+    # runs in the same pod hit the on-disk cache + the in-process model
+    # cache and finish in <2s, but the cold-cache path needs the bigger
+    # budget.  Leaving 180s also covers slow egress through colima.
+    deadline = time.time() + 180
     final_status = None
     while time.time() < deadline:
         async with factory() as session:
