@@ -51,18 +51,26 @@ pytestmark = pytest.mark.unit
 def stub_lance_add_columns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> dict[str, Any]:
-    """Default fixture: stub lance_io.add_columns_from_func.
+    """Default fixture: stub the two ``lance_io`` seams the executor uses.
 
     Every executor test path that reaches the lance call must NOT hit a
-    real bucket.  We capture the call so individual tests can assert
-    on the transform / read_columns shape.  Returns the capture dict
-    keyed by ``calls`` (list).
+    real bucket.  We capture the calls so individual tests can assert
+    on the transform / read_columns shape and on the validator's input.
+    Returns the capture dict keyed by ``calls`` (add_columns) and
+    ``schema_calls`` (read_dataset_schema).
+
+    The default fake schema covers ``title`` and ``body`` as utf8
+    strings -- the columns existing rules use.  Tests that need a
+    different schema (missing column / non-string type) override the
+    stub via their own monkeypatch.
 
     Tests that need to drive the transform callable themselves
-    overwrite this stub via their own monkeypatch.
+    overwrite the add_columns stub via their own monkeypatch.
     """
 
-    capture: dict[str, Any] = {"calls": []}
+    pa = pytest.importorskip("pyarrow")
+
+    capture: dict[str, Any] = {"calls": [], "schema_calls": []}
 
     def _fake_add(
         uri: str,
@@ -81,7 +89,28 @@ def stub_lance_add_columns(
         # that care about a different count override this stub.
         return 5
 
+    # Schema covers the columns every existing rule uses; broad
+    # enough that the default ``_validate_source_columns`` call
+    # passes for ``["title"]`` and ``["title", "body"]`` alike.
+    default_schema = pa.schema([
+        pa.field("id", pa.int64()),
+        pa.field("title", pa.string()),
+        pa.field("body", pa.string()),
+    ])
+
+    def _fake_schema(
+        uri: str,
+        *,
+        storage_options: dict[str, str] | None = None,
+    ) -> Any:
+        capture["schema_calls"].append({
+            "uri": uri,
+            "storage_options": storage_options,
+        })
+        return default_schema
+
     monkeypatch.setattr(lance_io, "add_columns_from_func", _fake_add)
+    monkeypatch.setattr(lance_io, "read_dataset_schema", _fake_schema)
     return capture
 
 
@@ -127,18 +156,20 @@ async def _make_rule(
     target_column: str = "embedding",
     model_name: str = "mock",
     source_columns: list[str] | None = None,
+    extra: dict[str, Any] | None = None,
 ) -> VectorizationRule:
     rule = VectorizationRule(
         dataset_uuid=dataset_uuid,
         target_column=target_column,
-        # beta.2a: single-column default.  Tests that exercise the
-        # multi-column NotImplementedError path pass an explicit list.
+        # Default single-column rule keeps the bulk of the suite
+        # unchanged; multi-column tests pass an explicit list.
         source_columns=source_columns if source_columns is not None else ["title"],
         model_name=model_name,
         model_version="v1",
         batch_size=64,
         trigger_type="ON_INSERT",
         enabled=enabled,
+        extra=extra,
     )
     session.add(rule)
     await session.commit()
@@ -376,14 +407,41 @@ class TestPayload:
 
 class TestLanceLoop:
 
-    async def test_multi_column_rule_raises_not_implemented(
+    async def test_single_column_rule_still_works(
         self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
     ) -> None:
-        # beta.2a is single-column only; multi-column concat needs a
-        # contract decision (separator, NULL handling) which is
-        # deferred to beta.2b.  Surface that loudly so callers do not
-        # silently get a vector built from one column when they passed
-        # two.
+        # beta.2b unifies the single- and multi-column code paths; the
+        # single-column case must still go through unchanged.  This is
+        # the regression guard for the old ``len == 1`` branch.
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            source_columns=["title"],
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        # read_columns matches the rule exactly, no ad-hoc unwrap.
+        assert stub_lance_add_columns["calls"][0]["read_columns"] == ["title"]
+        # New payload field is present even when only one column is
+        # configured -- contract is uniform across single / multi.
+        assert result.payload["concat_separator"] == " "
+
+    async def test_multi_column_concat_default_separator(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        # beta.2b: two columns concat with the default single-space
+        # separator.  Drive the transform directly so we can read the
+        # exact strings the encoder saw.
+        pa = pytest.importorskip("pyarrow")
+
         ds = await _make_dataset(session)
         rule = await _make_rule(
             session,
@@ -394,7 +452,230 @@ class TestLanceLoop:
             dataset_uuid=ds.dataset_uuid,
             params={"vectorization_rule_id": rule.id},
         )
-        with pytest.raises(NotImplementedError, match="beta.2b"):
+        # Capture the inputs the mock encoder receives so we can
+        # assert on the concatenation, not just the vector shape.
+        captured: dict[str, Any] = {}
+
+        def _spy_hash(texts: Any) -> list[list[float]]:
+            captured.setdefault("texts", []).extend(list(texts))
+            return [[0.0] * 384 for _ in texts]
+
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+
+        call = stub_lance_add_columns["calls"][0]
+        assert call["read_columns"] == ["title", "body"]
+        # Exercise the transform with a synthetic 2-row batch.
+        in_batch = pa.RecordBatch.from_arrays(
+            [
+                pa.array(["hello", "foo"]),
+                pa.array(["world", "bar"]),
+            ],
+            names=["title", "body"],
+        )
+        # Patch hash_embedding for the duration of the transform call
+        # so we can read the materialised inputs.  Patch via the
+        # module the executor imports from -- name resolution happens
+        # at call time inside the closure.
+        original = embedding_module.hash_embedding
+        embedding_module.hash_embedding = _spy_hash
+        try:
+            out_batch = call["transforms"](in_batch)
+        finally:
+            embedding_module.hash_embedding = original
+        # Default separator is one ASCII space.
+        assert captured["texts"] == ["hello world", "foo bar"]
+        assert out_batch.num_rows == 2
+        assert out_batch.schema.names == ["embedding"]
+        # Payload reports the same default separator.
+        assert result.payload["concat_separator"] == " "
+        assert result.payload["source_columns"] == ["title", "body"]
+
+    async def test_multi_column_custom_separator_via_extra(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        # ``rule.extra["concat_separator"]`` overrides the default;
+        # newline is a common pick when the encoder treats it as a
+        # sentence boundary.
+        pa = pytest.importorskip("pyarrow")
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            source_columns=["title", "body"],
+            extra={"concat_separator": "\n"},
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+
+        captured: list[str] = []
+
+        def _spy_hash(texts: Any) -> list[list[float]]:
+            captured.extend(list(texts))
+            return [[0.0] * 384 for _ in texts]
+
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        call = stub_lance_add_columns["calls"][0]
+        in_batch = pa.RecordBatch.from_arrays(
+            [pa.array(["a"]), pa.array(["b"])],
+            names=["title", "body"],
+        )
+        original = embedding_module.hash_embedding
+        embedding_module.hash_embedding = _spy_hash
+        try:
+            call["transforms"](in_batch)
+        finally:
+            embedding_module.hash_embedding = original
+        assert captured == ["a\nb"]
+        # Separator surfaced verbatim in the payload.
+        assert result.payload["concat_separator"] == "\n"
+
+    async def test_multi_column_skips_null_fields(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+    ) -> None:
+        # NULL fields are dropped before joining, so a single-NULL row
+        # does not leak a stray separator into the encoded text and
+        # an all-NULL row degrades to "" (matches single-column NULL
+        # behaviour from beta.2a).
+        pa = pytest.importorskip("pyarrow")
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            source_columns=["title", "body"],
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+
+        captured: list[str] = []
+
+        def _spy_hash(texts: Any) -> list[list[float]]:
+            captured.extend(list(texts))
+            return [[0.0] * 384 for _ in texts]
+
+        await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+        call = stub_lance_add_columns["calls"][0]
+        # Three rows: title-NULL, body-NULL, both-NULL.
+        in_batch = pa.RecordBatch.from_arrays(
+            [
+                pa.array([None, "foo", None]),
+                pa.array(["world", None, None]),
+            ],
+            names=["title", "body"],
+        )
+        original = embedding_module.hash_embedding
+        embedding_module.hash_embedding = _spy_hash
+        try:
+            out_batch = call["transforms"](in_batch)
+        finally:
+            embedding_module.hash_embedding = original
+        # No leading / trailing separators; all-NULL row -> empty str.
+        assert captured == ["world", "foo", ""]
+        assert out_batch.num_rows == 3
+
+    async def test_missing_source_column_raises_value_error(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Validator runs before the model probe / lance write; a typo
+        # in source_columns must surface as a clear ValueError, not a
+        # cryptic lance / encoder failure deep in the transform.
+        pa = pytest.importorskip("pyarrow")
+
+        # Schema lacks ``body``; the rule asks for it.
+        narrow_schema = pa.schema([
+            pa.field("id", pa.int64()),
+            pa.field("title", pa.string()),
+        ])
+        monkeypatch.setattr(
+            lance_io,
+            "read_dataset_schema",
+            lambda uri, *, storage_options=None: narrow_schema,
+        )
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            source_columns=["title", "body"],
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        with pytest.raises(ValueError, match="not found in dataset schema"):
+            await EmbeddingExecutor().execute(
+                session, task=task, dataset=ds,
+            )
+        # And no lance write happened: short-circuit on validation.
+        assert stub_lance_add_columns["calls"] == []
+
+    async def test_non_string_source_column_raises_value_error(
+        self, session: AsyncSession,
+        stub_lance_add_columns: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Numeric column would silently get str()'d if we coerced; the
+        # contract says no -- embedding user_ids is almost never what
+        # the operator wanted, so we fail loud.
+        pa = pytest.importorskip("pyarrow")
+
+        wrong_typed_schema = pa.schema([
+            pa.field("title", pa.string()),
+            pa.field("body", pa.int64()),  # NOT string
+        ])
+        monkeypatch.setattr(
+            lance_io,
+            "read_dataset_schema",
+            lambda uri, *, storage_options=None: wrong_typed_schema,
+        )
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            source_columns=["title", "body"],
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        with pytest.raises(ValueError, match="must be utf8 string type"):
+            await EmbeddingExecutor().execute(
+                session, task=task, dataset=ds,
+            )
+        assert stub_lance_add_columns["calls"] == []
+
+    async def test_empty_source_columns_raises_value_error(
+        self, session: AsyncSession,
+    ) -> None:
+        # Defence in depth: REST should reject this at create time,
+        # but an old/malformed row must not silently embed nothing.
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            source_columns=[],
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        with pytest.raises(ValueError, match="empty source_columns"):
             await EmbeddingExecutor().execute(
                 session, task=task, dataset=ds,
             )

@@ -57,6 +57,10 @@ class _FakeDataset:
     uri: str
     rows: int = 5
     latest_version: int = 1
+    # ``schema`` is a property in real lance; an attribute is enough
+    # here -- tests that exercise read_dataset_schema set it explicitly.
+    # Default ``None`` keeps existing tests untouched.
+    schema: Any = None
     deleted_predicates: list[str] = field(default_factory=list)
     create_index_calls: list[dict[str, Any]] = field(default_factory=list)
     listed_indices: list[Any] = field(default_factory=list)
@@ -431,6 +435,36 @@ class TestCountRows:
 
     def test_returns_int(self, fake_lance: _FakeLance) -> None:
         assert lance_io.count_rows("s3://b/t.lance", storage_options={"e": "x"}) == 5
+
+
+# ---------------------------------------------------------------------------
+# read_dataset_schema
+# ---------------------------------------------------------------------------
+
+
+class TestReadDatasetSchema:
+
+    def test_returns_underlying_dataset_schema(
+        self, fake_lance: _FakeLance,
+    ) -> None:
+        # Pre-seed a fake schema sentinel; real callers get a pyarrow
+        # ``Schema``, but the wrapper just forwards ``ds.schema``.
+        sentinel = object()
+        ds_uri = "s3://b/t.lance"
+        fake_lance._cache[ds_uri] = _FakeDataset(uri=ds_uri, schema=sentinel)
+        result = lance_io.read_dataset_schema(
+            ds_uri, storage_options={"e": "x"},
+        )
+        assert result is sentinel
+
+    def test_passes_storage_options_through(
+        self, fake_lance: _FakeLance,
+    ) -> None:
+        # Same precedence rule as the other helpers: the dict caller
+        # gives us must reach ``lance.dataset(...)`` verbatim.
+        opts = {"endpoint": "http://minio:9000"}
+        lance_io.read_dataset_schema("s3://b/t.lance", storage_options=opts)
+        assert fake_lance.opened[0] == ("s3://b/t.lance", opts)
 
 
 # ---------------------------------------------------------------------------

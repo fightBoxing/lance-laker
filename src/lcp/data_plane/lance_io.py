@@ -334,6 +334,29 @@ def add_columns_from_func(
     ds_after = open_dataset(uri, storage_options=storage_options)
     return int(ds_after.count_rows())
 
+
+def read_dataset_schema(
+    uri: str,
+    *,
+    storage_options: dict[str, str] | None = None,
+) -> Any:
+    """Return the dataset's pyarrow ``Schema``.
+
+    Lifted into this module for the same reason as the other helpers:
+    callers (``EmbeddingExecutor`` validates ``source_columns`` before
+    dispatching the lance write) need to inspect the on-disk schema,
+    and we want a single seam tests can monkey-patch instead of every
+    caller learning to mock ``lance.dataset(...).schema``.
+
+    Returns the raw pyarrow ``Schema`` object so callers can use the
+    standard pyarrow API (``schema.field(name)``, ``schema.names``)
+    rather than re-inventing accessors here.
+    """
+
+    ds = open_dataset(uri, storage_options=storage_options)
+    return ds.schema
+
+
 # ---------------------------------------------------------------------------
 # Read-only helpers (used by e2e and tests)
 # ---------------------------------------------------------------------------

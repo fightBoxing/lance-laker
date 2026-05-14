@@ -8,25 +8,39 @@ executor is the async half: it consumes ``VECTORIZE`` tasks the REST
 layer (or a future planner) enqueues against that rule and runs the
 embedding model against the lance dataset.
 
-Slice 4 / B.6 (beta.2a) scoping
--------------------------------
-beta.2a closes the lance read/write loop with **single source column**
-support:
+Slice 4 / B.6 (beta.2a -> beta.2b) scoping
+------------------------------------------
+beta.2a closed the lance read/write loop with **single source column**
+support.  beta.2b extends that to **multi-column concat**:
 
-* read the named ``source_column`` from the dataset (one projected
-  column, no multi-column concat);
+* read every ``source_column`` from the dataset in the order the rule
+  declares them;
+* concat the projected fields per row with a configurable separator,
+  skipping NULL fields (so ``title=None, body="hi"`` becomes ``"hi"``,
+  not ``" hi"``); the all-NULL row degrades to ``""`` exactly like the
+  single-column NULL case;
 * run :func:`lcp.embeddings.hash_embedding` (mock) or
   :func:`lcp.embeddings.st_embedding` (real model) per record batch;
 * write the resulting fixed-size vector list back via
   :func:`lcp.data_plane.lance_io.add_columns_from_func` to the
   ``target_column``.
 
-What beta.2a deliberately does NOT do
--------------------------------------
-* multi-column concat (``len(rule.source_columns) > 1``).  Concat
-  semantics (separator, NULL handling) need a contract before we
-  silently pick one; until then we raise ``NotImplementedError`` so
-  callers see this is missing rather than getting wrong vectors.
+The separator defaults to a single space and can be overridden per-rule
+via ``rule.extra["concat_separator"]``; we deliberately do NOT add a
+first-class column on ``vectorization_rule`` for it -- the JSON ``extra``
+bag is the existing escape hatch and graduating the field is reversible
+when a real consumer asks for it.
+
+Schema validation
+-----------------
+Before the lance loop starts we read the dataset schema once and assert
+*every* ``source_column`` exists and is utf8-string.  This trades one
+cheap roundtrip for a *clear* business error (FAILED with
+``ValueError``) instead of letting lance crash mid-batch with a less
+actionable message.
+
+What this executor deliberately does NOT do
+-------------------------------------------
 * batch streaming control / progress reporting.  ``add_columns_from_func``
   iterates fragments internally; we do not yet expose per-batch
   progress.  Adequate for the smoke harness (~5 rows); revisit when
@@ -54,7 +68,8 @@ Failure modes
   no-ops).
 * Disabled rule  -> ``ValueError``  -> matches the REST layer's
   expectation that ``enabled=False`` rules never run.
-* Multi-column rule -> ``NotImplementedError`` (deferred to beta.2b).
+* Source column missing or non-string  -> ``ValueError`` (raised by
+  the schema validator before any model probe / lance write).
 * Real-model load failure (e.g. unknown model_name, no network)
   surfaces the underlying ``sentence-transformers`` /
   :class:`SentenceTransformersNotInstalledError`.
@@ -88,13 +103,26 @@ from lcp.workers.executors.base import (
 # ``vectorization_rule.model_name`` column.
 _MOCK_MODEL_NAME: str = "mock"
 
+# Default separator inserted between source columns when concatenating
+# multiple fields into the encoder input.  Single ASCII space is the
+# least surprising choice for natural-language fields; rules that need
+# something else set ``rule.extra["concat_separator"]``.  Surfaced as a
+# constant so the executor and the payload report the same value.
+_DEFAULT_CONCAT_SEPARATOR: str = " "
+
+# Key under ``rule.extra`` used to override the concat separator.
+# Single source of truth so a future REST schema change can promote
+# this field to a first-class column without grepping for the literal.
+_EXTRA_KEY_CONCAT_SEPARATOR: str = "concat_separator"
+
 
 def _build_batch_transform(
     *,
-    source_column: str,
+    source_columns: list[str],
     target_column: str,
     model_name: str,
     vector_dim: int,
+    separator: str,
 ) -> Any:
     """Return a lance ``AddColumnsUDF`` that fills ``target_column``.
 
@@ -105,10 +133,17 @@ def _build_batch_transform(
     ``lance_io.add_columns_from_func`` stays generic.
 
     The UDF input is a ``pa.RecordBatch`` projected to
-    ``[source_column]``; the output is a ``pa.RecordBatch`` carrying
+    ``source_columns``; the output is a ``pa.RecordBatch`` carrying
     only the new ``target_column``.  ``output_schema`` is built up
     front so lance can validate the very first batch and we get a
     clear error if the encoder ever returns the wrong dim.
+
+    Multi-column behaviour (beta.2b): per row, we project each named
+    column, drop NULL fields, and join the surviving values with
+    ``separator``.  Single-column rules are just the degenerate case
+    of this loop -- one column, no separator ever inserted -- so we do
+    NOT branch on ``len(source_columns) == 1`` (Karpathy rule 2: same
+    code path beats two near-identical ones).
 
     The pyarrow / lance imports are local so this module loads cleanly
     when the ``[lance]`` extras are absent -- the wrap only happens at
@@ -127,14 +162,22 @@ def _build_batch_transform(
     output_schema = pa.schema([pa.field(target_column, out_type)])
 
     def _transform(batch: pa.RecordBatch) -> pa.RecordBatch:
-        # Pull the source column as Python strings.  ``to_pylist`` is
-        # the fastest path for small batches and avoids forcing
-        # callers to know about pyarrow types.
-        texts = batch.column(source_column).to_pylist()
-        # Lance may pass NULLs through; coerce defensively so the
-        # encoder never sees ``None``.  Real-model encoders crash on
-        # None; mock encoder also requires ``str``.
-        materialised = [t if isinstance(t, str) else "" for t in texts]
+        # Materialise every source column as a Python list once;
+        # ``to_pylist`` is the fastest path for small batches and
+        # avoids forcing callers to know about pyarrow types.  All
+        # projected columns share the batch's row count, so we can
+        # zip them straight away.
+        per_column = [
+            batch.column(name).to_pylist() for name in source_columns
+        ]
+        materialised: list[str] = []
+        for row in zip(*per_column, strict=True):
+            # Skip NULL fields per the beta.2b contract; encoders
+            # crash on ``None``, and including a sentinel like ""
+            # would inject spurious separators (``"foo" + " " + ""``
+            # -> trailing space -> different embedding from ``"foo"``).
+            parts = [v for v in row if isinstance(v, str)]
+            materialised.append(separator.join(parts))
         if is_mock:
             vectors = hash_embedding(materialised)
         else:
@@ -145,6 +188,55 @@ def _build_batch_transform(
         )
 
     return lance.batch_udf(output_schema=output_schema)(_transform)
+
+
+def _validate_source_columns(
+    *,
+    storage_uri: str,
+    source_columns: list[str],
+    storage_options: dict[str, str],
+) -> None:
+    """Assert every ``source_column`` exists and is utf8-string typed.
+
+    Reads the dataset schema via :func:`lance_io.read_dataset_schema`
+    so unit tests can monkey-patch a single seam instead of standing
+    up a real lance dataset.  Raises :class:`ValueError` with the
+    offending column name(s) -- the worker maps that to FAILED with
+    ``error_code="ValueError"``, which is the same surface every other
+    business-precondition violation in this executor uses.
+
+    Why string-only: real / mock embedding backends both consume
+    ``list[str]``.  Numeric or struct columns would silently get
+    ``str(value)`` if we stringified, embedding e.g. user_ids -- which
+    is almost never what the operator wanted.  Failing loud forces a
+    deliberate decision rather than a quiet mis-vectorisation.
+    """
+
+    import pyarrow as pa
+
+    schema = lance_io.read_dataset_schema(
+        storage_uri, storage_options=storage_options,
+    )
+    schema_names = set(schema.names)
+    missing = [c for c in source_columns if c not in schema_names]
+    if missing:
+        raise ValueError(
+            f"VECTORIZE source_columns not found in dataset schema: "
+            f"missing={missing!r} available={sorted(schema_names)!r}",
+        )
+    non_string = [
+        c for c in source_columns
+        # ``pa.types.is_string`` matches utf8 (the lance default for
+        # text); large_string would also be safe to embed but we keep
+        # the contract narrow until a real caller asks for it.
+        if not pa.types.is_string(schema.field(c).type)
+    ]
+    if non_string:
+        types = {c: str(schema.field(c).type) for c in non_string}
+        raise ValueError(
+            f"VECTORIZE source_columns must be utf8 string type; "
+            f"non-string columns: {types!r}",
+        )
 
 
 class EmbeddingExecutor(LifecycleExecutor):
@@ -192,15 +284,33 @@ class EmbeddingExecutor(LifecycleExecutor):
             )
 
         source_columns = list(rule.source_columns)
-        if len(source_columns) != 1:
-            # beta.2a: single-column only.  Multi-column concat needs a
-            # separator + NULL-handling contract before we pick one
-            # silently.  Tracked as beta.2b.
-            raise NotImplementedError(
-                "VECTORIZE multi-column concat is deferred to beta.2b; "
-                f"got source_columns={source_columns!r}",
+        if not source_columns:
+            # The REST layer rejects empty source_columns at create
+            # time; this is defensive in case an old row predates that
+            # validation -- failing loud beats embedding nothing.
+            raise ValueError(
+                f"VECTORIZE rule has empty source_columns: id={rule_id}",
             )
-        source_column = source_columns[0]
+
+        # Per-rule separator override; default kept in a module-level
+        # constant so the payload (below) and the transform agree on
+        # the same value.
+        extra = rule.extra or {}
+        separator = str(
+            extra.get(_EXTRA_KEY_CONCAT_SEPARATOR, _DEFAULT_CONCAT_SEPARATOR),
+        )
+
+        # Validate schema BEFORE probing the model: if the dataset
+        # does not even have the columns the rule asks for, no amount
+        # of model loading will help and we want the failure cheap.
+        settings = get_settings()
+        storage_options = lance_io.build_storage_options(settings)
+        await asyncio.to_thread(
+            _validate_source_columns,
+            storage_uri=dataset.storage_uri,
+            source_columns=source_columns,
+            storage_options=storage_options,
+        )
 
         # Probe the encoder once up front to learn the vector dim --
         # we need it to build ``output_schema`` for the lance UDF
@@ -220,10 +330,11 @@ class EmbeddingExecutor(LifecycleExecutor):
         # touch lance yet -- the call site below dispatches it on a
         # worker thread.
         transform = _build_batch_transform(
-            source_column=source_column,
+            source_columns=source_columns,
             target_column=rule.target_column,
             model_name=rule.model_name,
             vector_dim=vector_dim,
+            separator=separator,
         )
         mode = "mock" if rule.model_name == _MOCK_MODEL_NAME else "real-model"
 
@@ -231,13 +342,11 @@ class EmbeddingExecutor(LifecycleExecutor):
         # stays responsive (mirrors ttl_delete / index_build).  Any
         # lance / model exception propagates so the worker maps it to
         # FAILED with a clear error_code.
-        settings = get_settings()
-        storage_options = lance_io.build_storage_options(settings)
         rows_after = await asyncio.to_thread(
             lance_io.add_columns_from_func,
             dataset.storage_uri,
             transforms=transform,
-            read_columns=[source_column],
+            read_columns=source_columns,
             storage_options=storage_options,
         )
 
@@ -254,6 +363,10 @@ class EmbeddingExecutor(LifecycleExecutor):
                 "model_version": rule.model_version,
                 "target_column": rule.target_column,
                 "source_columns": source_columns,
+                # Surfaced so operators can see at a glance which sep
+                # the encoder actually used for this run -- handy when
+                # rule.extra was edited between runs.
+                "concat_separator": separator,
                 "batch_size": rule.batch_size,
                 "vector_dim": vector_dim,
                 "vector_count": int(rows_after),
