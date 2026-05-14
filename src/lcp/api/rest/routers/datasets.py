@@ -24,6 +24,20 @@ from lcp.services import dataset_service
 router = APIRouter(prefix="/v1/datasets", tags=["datasets"])
 
 
+def _not_found(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={"code": "NOT_FOUND", "message": message},
+    )
+
+
+def _conflict(code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": code, "message": message},
+    )
+
+
 @router.get("", response_model=DatasetListResponse, summary="List datasets")
 async def list_datasets(
     session: Annotated[AsyncSession, SessionDep],
@@ -66,10 +80,7 @@ async def create_dataset(
     try:
         obj = await dataset_service.create_dataset(session, payload)
     except dataset_service.DatasetAlreadyExistsError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "ALREADY_EXISTS", "message": str(exc)},
-        ) from exc
+        raise _conflict("ALREADY_EXISTS", str(exc)) from exc
     return DatasetResponse.model_validate(obj)
 
 
@@ -88,10 +99,7 @@ async def get_dataset(
     try:
         obj = await dataset_service.get_dataset(session, dataset_uuid)
     except dataset_service.DatasetNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "NOT_FOUND", "message": f"dataset {dataset_uuid} not found"},
-        ) from exc
+        raise _not_found(f"dataset {dataset_uuid} not found") from exc
     return DatasetResponse.model_validate(obj)
 
 
@@ -110,7 +118,4 @@ async def delete_dataset(
     try:
         await dataset_service.delete_dataset(session, dataset_uuid)
     except dataset_service.DatasetNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "NOT_FOUND", "message": f"dataset {dataset_uuid} not found"},
-        ) from exc
+        raise _not_found(f"dataset {dataset_uuid} not found") from exc
