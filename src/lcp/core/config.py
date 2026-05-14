@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import warnings
-from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -131,8 +130,27 @@ class Settings(BaseSettings):
             )
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    """Return a cached Settings instance."""
+_settings: Settings | None = None
 
-    return Settings()
+
+def get_settings() -> Settings:
+    """Return the shared ``Settings`` singleton, creating it on first call.
+
+    Use :func:`reset_settings` in tests to force a fresh instance on the
+    next call.  The explicit singleton avoids the ``lru_cache.cache_clear()``
+    ritual that test authors are otherwise required to remember.
+    """
+
+    global _settings  # noqa: PLW0603
+    if _settings is None:
+        _settings = Settings()
+    return _settings
+
+
+def reset_settings() -> None:
+    """Reset the singleton so the next :func:`get_settings` call creates a
+    fresh instance.  For test use only.
+    """
+
+    global _settings  # noqa: PLW0603
+    _settings = None

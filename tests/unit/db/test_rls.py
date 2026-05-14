@@ -185,14 +185,14 @@ class TestBeforeExecuteHook:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("LCP_ENFORCE_TENANT_RLS", "false")
-        from lcp.core.config import get_settings
-        get_settings.cache_clear()
+        from lcp.core.config import reset_settings
+        reset_settings()
         try:
             stmt = select(tables["dataset"])
             out_stmt, _, _ = _before_execute(None, stmt, None, None, {})
             assert out_stmt is stmt
         finally:
-            get_settings.cache_clear()
+            reset_settings()
 
     def test_injects_when_principal_bound(self, tables: dict[str, Table]) -> None:
         token = set_current_tenant(

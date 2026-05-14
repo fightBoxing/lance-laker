@@ -6,7 +6,7 @@ import warnings
 
 import pytest
 
-from lcp.core.config import Settings, get_settings
+from lcp.core.config import Settings, get_settings, reset_settings
 
 pytestmark = pytest.mark.unit
 
@@ -53,25 +53,25 @@ class TestEnvOverride:
     def test_env_overrides_are_picked_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("LCP_OIDC_AUDIENCE", "custom-aud")
         monkeypatch.setenv("LCP_DB_POOL_SIZE", "42")
-        get_settings.cache_clear()
+        reset_settings()
         try:
             settings = get_settings()
             assert settings.oidc_audience == "custom-aud"
             assert settings.db_pool_size == 42
         finally:
-            get_settings.cache_clear()
+            reset_settings()
 
 
 class TestGetSettingsCached:
 
     def test_same_instance_on_repeated_calls(self) -> None:
-        get_settings.cache_clear()
+        reset_settings()
         try:
             a = get_settings()
             b = get_settings()
             assert a is b
         finally:
-            get_settings.cache_clear()
+            reset_settings()
 
 
 class TestUnknownEnvVarWarning:
