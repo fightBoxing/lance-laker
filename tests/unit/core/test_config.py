@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from lcp.core.config import Settings, get_settings
@@ -70,3 +72,29 @@ class TestGetSettingsCached:
             assert a is b
         finally:
             get_settings.cache_clear()
+
+
+class TestUnknownEnvVarWarning:
+    """M-7: extra="ignore" is kept for compatibility but typos must be visible."""
+
+    def test_warns_on_typo_env_var(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A misspelled LCP_ variable must produce a UserWarning."""
+
+        monkeypatch.setenv("LCP_OIDC_AUDIANCE", "typo-value")  # <- missing D
+        with pytest.warns(UserWarning, match="LCP_OIDC_AUDIANCE"):
+            Settings()
+
+    def test_no_warning_for_known_vars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Correctly spelled LCP_ variables must not trigger a warning."""
+
+        monkeypatch.setenv("LCP_OIDC_AUDIENCE", "valid-aud")
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            Settings()  # must not raise
+
+    def test_no_warning_with_no_lcp_extras(self) -> None:
+        """Baseline: the default environment must not warn."""
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            Settings()  # must not raise

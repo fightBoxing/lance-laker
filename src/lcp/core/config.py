@@ -8,6 +8,8 @@ Kubernetes secrets or Vault.
 
 from __future__ import annotations
 
+import os
+import warnings
 from functools import lru_cache
 
 from pydantic import Field
@@ -96,6 +98,37 @@ class Settings(BaseSettings):
     # bucket subdomains.  Real AWS S3 prefers virtual-hosted, so flip this
     # off when pointing at AWS.
     lance_storage_path_style: bool = True
+
+    def model_post_init(self, __context: object) -> None:  # noqa: ANN001
+        """Warn on unrecognised ``LCP_``-prefixed environment variables.
+
+        ``extra="ignore"`` prevents start-up failures when the process
+        environment contains unrelated ``LCP_`` variables (e.g. from another
+        service sharing the same host).  However, a silent ignore also means
+        typos like ``LCP_OIDC_AUDIANCE`` pass unnoticed and the intended
+        override never takes effect.
+
+        This hook bridges the gap: it scans ``os.environ`` for ``LCP_``
+        keys that do not map to a known field and emits a ``UserWarning``.
+        The warning is surfaced at startup so operators spot typos
+        immediately without requiring a full ``extra="forbid"`` policy.
+        """
+        known = {
+            f"LCP_{name.upper()}"
+            for name in self.__class__.model_fields
+        }
+        unknown = [
+            key
+            for key in os.environ
+            if key.startswith("LCP_") and key not in known
+        ]
+        if unknown:
+            warnings.warn(
+                f"Unrecognised LCP_ environment variable(s): {', '.join(sorted(unknown))}. "
+                "Check for typos — these settings will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 @lru_cache(maxsize=1)

@@ -1,0 +1,289 @@
+{
+  "version": 1,
+  "bugs": [
+    {
+      "id": "bug-001",
+      "timestamp": "2026-05-14T02:35:12.162Z",
+      "error_message": "Significant refactor of ",
+      "file": "src/lcp/services/scheduler_service.py",
+      "root_cause": "2 lines replaced/restructured",
+      "fix": "Rewrote 9→15 lines (2 removed) | Also: def _utcnow() -> datetime:; \"\"\"Return naive UTC datetime that matches the DATE",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-05-14T02:40:11.623Z"
+    },
+    {
+      "id": "bug-002",
+      "timestamp": "2026-05-14T02:35:34.918Z",
+      "error_message": "Wrong reference: func should be case",
+      "file": "src/lcp/services/scheduler_service.py",
+      "root_cause": "Used \"func\" instead of \"case\"",
+      "fix": "Changed func → case",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 5,
+      "last_seen": "2026-05-14T02:42:08.023Z"
+    },
+    {
+      "id": "bug-003",
+      "timestamp": "2026-05-14T02:39:18.264Z",
+      "error_message": "Significant refactor of ",
+      "file": "src/lcp/services/task_service.py",
+      "root_cause": "5 lines replaced/restructured",
+      "fix": "Rewrote 11→6 lines (5 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:39:18.264Z"
+    },
+    {
+      "id": "bug-004",
+      "timestamp": "2026-05-14T02:39:31.924Z",
+      "error_message": "Wrong reference: _utcnow should be utcnow_naive",
+      "file": "src/lcp/services/task_service.py",
+      "root_cause": "Used \"_utcnow\" instead of \"utcnow_naive\"",
+      "fix": "Changed _utcnow → utcnow_naive",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:39:31.924Z"
+    },
+    {
+      "id": "bug-005",
+      "timestamp": "2026-05-14T02:41:37.880Z",
+      "error_message": "Missing error handling in unknown",
+      "file": "src/lcp/services/scheduler_service.py",
+      "root_cause": "Code path had no error handling — exceptions would propagate uncaught",
+      "fix": "Added try/catch block",
+      "tags": [
+        "auto-detected",
+        "error-handling",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:41:37.880Z"
+    },
+    {
+      "id": "bug-006",
+      "timestamp": "2026-05-14T02:42:36.754Z",
+      "error_message": "Significant refactor of ",
+      "file": "src/lcp/services/index_service.py",
+      "root_cause": "3 lines replaced/restructured",
+      "fix": "Rewrote 7→4 lines (3 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:42:36.754Z"
+    },
+    {
+      "id": "bug-007",
+      "timestamp": "2026-05-14T02:42:49.555Z",
+      "error_message": "Wrong reference: _utcnow should be utcnow_naive",
+      "file": "src/lcp/services/index_service.py",
+      "root_cause": "Used \"_utcnow\" instead of \"utcnow_naive\"",
+      "fix": "Changed _utcnow → utcnow_naive",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:42:49.555Z"
+    },
+    {
+      "id": "bug-008",
+      "timestamp": "2026-05-14T02:43:15.742Z",
+      "error_message": "Missing error handling in unknown",
+      "file": "src/lcp/services/lifecycle_planner_service.py",
+      "root_cause": "Code path had no error handling — exceptions would propagate uncaught",
+      "fix": "Added try/catch block",
+      "tags": [
+        "auto-detected",
+        "error-handling",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:43:15.742Z"
+    },
+    {
+      "id": "bug-009",
+      "timestamp": "2026-05-14T02:43:45.273Z",
+      "error_message": "Wrong reference: _utcnow should be utcnow_naive",
+      "file": "src/lcp/services/lifecycle_planner_service.py",
+      "root_cause": "Used \"_utcnow\" instead of \"utcnow_naive\"",
+      "fix": "Changed _utcnow → utcnow_naive",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:43:45.273Z"
+    },
+    {
+      "id": "bug-010",
+      "timestamp": "2026-05-14T02:46:18.440Z",
+      "error_message": "Wrong return value",
+      "file": "src/lcp/api/rest/auth.py",
+      "root_cause": "Was returning: any(path == p or path.startswith(p + \"/\") or path ",
+      "fix": "Now returns: any(path == p or path.startswith(p + \"/\") for p in",
+      "tags": [
+        "auto-detected",
+        "return-value",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:46:18.440Z"
+    },
+    {
+      "id": "bug-011",
+      "timestamp": "2026-05-14T02:46:48.308Z",
+      "error_message": "Significant refactor of ",
+      "file": "src/lcp/api/rest/auth.py",
+      "root_cause": "4 lines replaced/restructured",
+      "fix": "Rewrote 6→9 lines (4 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:46:48.308Z"
+    },
+    {
+      "id": "bug-012",
+      "timestamp": "2026-05-14T02:47:52.207Z",
+      "error_message": "Wrong reference: func should be select",
+      "file": "src/lcp/services/index_service.py",
+      "root_cause": "Used \"func\" instead of \"select\"",
+      "fix": "Changed func → select",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:47:52.207Z"
+    },
+    {
+      "id": "bug-013",
+      "timestamp": "2026-05-14T02:48:19.618Z",
+      "error_message": "Wrong reference: func should be select",
+      "file": "src/lcp/services/lifecycle_service.py",
+      "root_cause": "Used \"func\" instead of \"select\"",
+      "fix": "Changed func → select",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:48:19.618Z"
+    },
+    {
+      "id": "bug-014",
+      "timestamp": "2026-05-14T02:48:47.560Z",
+      "error_message": "Wrong reference: func should be select",
+      "file": "src/lcp/services/vectorization_service.py",
+      "root_cause": "Used \"func\" instead of \"select\"",
+      "fix": "Changed func → select",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T02:48:47.560Z"
+    },
+    {
+      "id": "bug-015",
+      "timestamp": "2026-05-14T03:16:48.839Z",
+      "error_message": "Significant refactor of ",
+      "file": "src/lcp/api/rest/routers/tasks.py",
+      "root_cause": "4 lines replaced/restructured",
+      "fix": "Rewrote 8→5 lines (4 removed) | Also: raise HTTPException(; status_code=status.HTTP_404_NOT_FOUND,",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 3,
+      "last_seen": "2026-05-14T03:17:16.650Z"
+    },
+    {
+      "id": "bug-016",
+      "timestamp": "2026-05-14T03:17:56.969Z",
+      "error_message": "Significant refactor of ",
+      "file": "src/lcp/api/rest/routers/datasets.py",
+      "root_cause": "4 lines replaced/restructured",
+      "fix": "Rewrote 8→5 lines (4 removed) | Also: raise HTTPException(; status_code=status.HTTP_404_NOT_FOUND,",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-05-14T03:18:09.561Z"
+    },
+    {
+      "id": "bug-017",
+      "timestamp": "2026-05-14T03:20:08.424Z",
+      "error_message": "Missing error handling in test_same_instance_on_repeated_calls",
+      "file": "tests/unit/core/test_config.py",
+      "root_cause": "Code path had no error handling — exceptions would propagate uncaught",
+      "fix": "Added try/catch block",
+      "tags": [
+        "auto-detected",
+        "error-handling",
+        "py"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T03:20:08.424Z"
+    }
+    {
+      "id": "bug-015",
+      "timestamp": "2026-05-14T11:10:00.000Z",
+      "error_message": "pydantic.warnings.PydanticDeprecatedSince211: Accessing the 'model_fields' attribute on the instance is deprecated.",
+      "file": "src/lcp/core/config.py",
+      "root_cause": "In model_post_init, used `self.model_fields` (instance access) which is deprecated in Pydantic V2.11; must use `self.__class__.model_fields` (class access).",
+      "fix": "Changed `self.model_fields` → `self.__class__.model_fields` in the known-fields set comprehension.",
+      "tags": ["pydantic", "model_post_init", "deprecation", "pydantic-v2.11"],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-14T11:10:00.000Z"
+    }
+  ]
+}
