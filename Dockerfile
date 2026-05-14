@@ -29,10 +29,27 @@ WORKDIR /app
 # skips the heavy install layer (Docker layer caching).
 COPY pyproject.toml uv.lock README-skeleton.md ./
 
+# Slice 4 / B.5: opt-in real-model embedding extras (sentence-transformers
+# + transformers + torch CPU).  Adds ~500 MB to the image, so default off:
+# build with `docker build --build-arg ENABLE_EMBEDDING=true -t lcp:dev .`
+# when the worker pod must run a real model.  The base image (default
+# build) still works -- VECTORIZE tasks with model_name='mock' do not
+# need the extras, and tasks with a real model_name fail loudly with
+# SentenceTransformersNotInstalledError so the operator sees exactly
+# what is missing.
+ARG ENABLE_EMBEDDING=false
+
 # Install runtime deps only (NO dev extras: pytest etc. don't need to
 # ship to k8s).  Two stages so a transitive dep change cannot invalidate
-# the source layer.
-RUN uv export --no-dev --frozen --no-emit-project --format requirements-txt --output-file /tmp/requirements.txt \
+# the source layer.  When ENABLE_EMBEDDING=true, fold the [embedding]
+# extras into the same export so torch / transformers land in the same
+# layer (kept as one RUN to avoid a wasted layer when the flag is off).
+RUN if [ "$ENABLE_EMBEDDING" = "true" ]; then \
+    EXTRA_FLAG="--extra embedding"; \
+    else \
+    EXTRA_FLAG=""; \
+    fi \
+    && uv export --no-dev --frozen --no-emit-project $EXTRA_FLAG --format requirements-txt --output-file /tmp/requirements.txt \
     && uv pip install --system --no-cache --requirement /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 

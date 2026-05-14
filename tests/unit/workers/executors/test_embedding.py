@@ -15,6 +15,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator
 from decimal import Decimal
+from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import (
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import StaticPool
 
 from lcp.db.models import Base, Dataset, Task, VectorizationRule
+from lcp.workers.executors import embedding as embedding_module
 from lcp.workers.executors.base import (
     ExecutorResult,
     build_default_registry,
@@ -79,12 +81,13 @@ async def _make_rule(
     dataset_uuid: str,
     enabled: bool = True,
     target_column: str = "embedding",
+    model_name: str = "mock",
 ) -> VectorizationRule:
     rule = VectorizationRule(
         dataset_uuid=dataset_uuid,
         target_column=target_column,
         source_columns=["title", "body"],
-        model_name="mock",
+        model_name=model_name,
         model_version="v1",
         batch_size=64,
         trigger_type="ON_INSERT",
@@ -201,7 +204,7 @@ class TestRuleLookup:
 
 class TestPayload:
 
-    async def test_stub_mode_payload(
+    async def test_mock_mode_payload(
         self, session: AsyncSession,
     ) -> None:
         ds = await _make_dataset(session)
@@ -218,9 +221,10 @@ class TestPayload:
         p = result.payload
         # Standard executor fields.
         assert p["executor"] == "EmbeddingExecutor"
-        # No lance_storage_endpoint configured in unit-test settings ->
-        # mode must be "stub".
-        assert p["mode"] == "stub"
+        # mock-named rule -> mock path; mode reflects vector source,
+        # not whether lance_storage_endpoint is configured (slice-4
+        # rename).
+        assert p["mode"] == "mock"
         assert p["dataset_uuid"] == ds.dataset_uuid
         assert p["storage_uri"] == ds.storage_uri
         # Rule fan-out: every field downstream consumers may want must
@@ -237,6 +241,75 @@ class TestPayload:
         assert p["would_call"] == "lance_io.add_columns_from_func"
         # Sanity: timestamp is ISO-formatted.
         assert "T" in p["executed_at"]
+
+    async def test_real_model_mode_payload(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Patch st_embedding so the real-model path is exercised
+        # without loading any sentence-transformers wheels.  Captures
+        # call args so we can assert the executor forwarded
+        # rule.model_name verbatim.
+        captured: dict[str, Any] = {}
+
+        def _fake_st(texts: Any, *, model_name: str) -> list[list[float]]:
+            captured["texts"] = list(texts)
+            captured["model_name"] = model_name
+            # Return a 768-d vector so we can also check vector_dim is
+            # NOT hard-coded to 384 in the real-model branch.
+            return [[0.0] * 768]
+
+        monkeypatch.setattr(embedding_module, "st_embedding", _fake_st)
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            model_name="sentence-transformers/all-mpnet-base-v2",
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        result = await EmbeddingExecutor().execute(
+            session, task=task, dataset=ds,
+        )
+
+        p = result.payload
+        assert p["mode"] == "real-model"
+        assert p["model_name"] == "sentence-transformers/all-mpnet-base-v2"
+        assert p["vector_dim"] == 768
+        # st_embedding must have been called with the rule's model_name,
+        # not the executor's mock literal.
+        assert captured["model_name"] == (
+            "sentence-transformers/all-mpnet-base-v2"
+        )
+
+    async def test_real_model_failure_propagates(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The worker maps any executor exception to FAILED with the
+        # exception class name as the error_code.  Make sure load /
+        # encode failures bubble out instead of being swallowed into
+        # a SUCCEEDED payload (which would silently lose data).
+        def _boom(_texts: Any, *, model_name: str) -> list[list[float]]:
+            raise RuntimeError(f"unknown model: {model_name}")
+
+        monkeypatch.setattr(embedding_module, "st_embedding", _boom)
+
+        ds = await _make_dataset(session)
+        rule = await _make_rule(
+            session,
+            dataset_uuid=ds.dataset_uuid,
+            model_name="made-up/non-existent",
+        )
+        task = _make_task(
+            dataset_uuid=ds.dataset_uuid,
+            params={"vectorization_rule_id": rule.id},
+        )
+        with pytest.raises(RuntimeError, match="unknown model"):
+            await EmbeddingExecutor().execute(
+                session, task=task, dataset=ds,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -8,19 +8,26 @@ executor is the async half: it consumes ``VECTORIZE`` tasks the REST
 layer (or a future planner) enqueues against that rule and runs the
 embedding model.
 
-Slice 3 scoping
+Slice 4 scoping
 ---------------
-Slice 3 ships the **mock model** + **call graph** only:
+Slice 4 adds the **real model client** path on top of slice-3's mock:
 
-* model is :func:`lcp.embeddings.hash_embedding`, a deterministic
-  hash-based vector generator (no torch / no model server);
-* the executor records what it would write to lance in the task
-  payload; it does NOT yet stream batches from lance and call
-  :func:`lcp.data_plane.lance_io.add_columns_from_func` because that
-  needs (a) a real source dataset with rows and (b) a real model
-  client whose batch-shape we can pin.  Both are deliberate next-slice
-  work; opening the lance write loop on top of mock data would only
-  pretend to test something we haven't built yet.
+* the mock path (:func:`lcp.embeddings.hash_embedding`) still runs when
+  ``rule.model_name`` is the literal ``"mock"`` -- keeps unit tests
+  and operator probes free of model downloads;
+* any other ``model_name`` is forwarded to
+  :func:`lcp.embeddings.st_embedding`, which loads the named model from
+  the Hugging Face hub the first time and caches it process-wide.
+
+What slice 4 still does NOT do (deliberate -- next slice):
+
+* read source rows from the lance dataset.  We still feed a fixed
+  probe list so the payload reports vector shape without needing a
+  populated lance table.  Once the lance read loop lands, the probe
+  list is replaced with a per-batch ``read_columns`` projection.
+* call :func:`lcp.data_plane.lance_io.add_columns_from_func` to write
+  the new column back; same reason -- pretending to write a fixed
+  vector for every row would mask read-loop bugs later.
 
 Task params contract
 --------------------
@@ -40,6 +47,11 @@ Failure modes
   no-ops).
 * Disabled rule  -> ``ValueError``  -> matches the REST layer's
   expectation that ``enabled=False`` rules never run.
+* Real-model load failure (e.g. unknown model_name, no network)
+  surfaces the underlying ``sentence-transformers`` /
+  :class:`SentenceTransformersNotInstalledError` -- the worker maps
+  this to FAILED with the exception class as the error code so an
+  operator can tell "wrong model id" from "wheel missing" at a glance.
 """
 
 from __future__ import annotations
@@ -47,24 +59,34 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lcp.core.config import get_settings
 from lcp.db.models import Dataset, Task, VectorizationRule
-from lcp.embeddings import hash_embedding
+from lcp.embeddings import hash_embedding, st_embedding
 from lcp.workers.executors.base import (
     ExecutorResult,
     LifecycleExecutor,
     utcnow_naive,
 )
 
-# Sample texts the mock model hashes so the payload reports vector
-# shape on the same input regardless of underlying lance state.  Keeps
-# slice 3 deterministic; replaced by real per-row data once the lance
-# read loop lands.
+# Reserved ``model_name`` value that bypasses the real-model path and
+# uses the deterministic hash mock instead.  Kept as a literal (not an
+# enum) because the value is also a wire-level identifier stored in the
+# ``vectorization_rule.model_name`` column.
+_MOCK_MODEL_NAME: str = "mock"
+
+# Probe text the executor encodes so the payload reports vector shape on
+# the same input regardless of underlying lance state.  Replaced by
+# per-batch ``read_columns`` projection once the lance read loop lands.
 _PROBE_TEXTS: tuple[str, ...] = ("__lcp_embedding_probe__",)
 
 
 class EmbeddingExecutor(LifecycleExecutor):
-    """Compute embeddings for a vectorization_rule (mock-model slice)."""
+    """Compute embeddings for a vectorization_rule.
+
+    Slice 3 wired the call graph with a deterministic mock model.
+    Slice 4 routes ``rule.model_name`` to either that mock or to a real
+    sentence-transformers model so the rest of the pipeline (REST,
+    task queue, worker, payload contract) keeps working unchanged.
+    """
 
     task_type = "VECTORIZE"
 
@@ -101,20 +123,22 @@ class EmbeddingExecutor(LifecycleExecutor):
                 f"VECTORIZE vectorization_rule is disabled: id={rule_id}",
             )
 
-        # Compute a probe vector so the payload reports the model's
-        # output shape on a fixed input.  This is the slice 3 stand-in
-        # for "we ran the model on N rows": same call shape, just on a
-        # canned input list.
-        vectors = hash_embedding(_PROBE_TEXTS)
+        # Route by model_name.  The mock path stays for unit tests and
+        # operator probes; everything else hits the real client.  Any
+        # exception from st_embedding (unknown model, missing wheel,
+        # network failure) propagates so the worker maps it to a
+        # FAILED task with a clear error_code.
+        if rule.model_name == _MOCK_MODEL_NAME:
+            mode = "mock"
+            vectors = hash_embedding(_PROBE_TEXTS)
+        else:
+            mode = "real-model"
+            vectors = st_embedding(
+                _PROBE_TEXTS, model_name=rule.model_name,
+            )
         vector_dim = len(vectors[0]) if vectors else 0
 
         now = utcnow_naive()
-        settings = get_settings()
-        # Real lance write-back lands in a follow-up slice; until we have
-        # a source dataset with real rows AND a real model client we
-        # would only be writing canned vectors, which is worse than not
-        # writing anything (it would mask read-loop bugs later).
-        mode = "real" if settings.lance_storage_endpoint else "stub"
 
         return ExecutorResult(
             payload={

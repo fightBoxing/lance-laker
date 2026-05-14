@@ -68,6 +68,23 @@ lance = [
     "pylance>=0.20.0",
     "pyarrow>=15.0.0",
 ]
+# Optional real-model embedding extras.  Install with
+# `pip install .[embedding]` when the worker process must run a real
+# sentence-transformers / Hugging Face model instead of the deterministic
+# hash mock used in unit tests and slice-3 smoke runs.  Kept optional
+# because torch + transformers add ~500 MB to the image and most CI / unit
+# environments only need the mock path.
+embedding = [
+    # MiniLM-L6-v2 is the slice-4 default; sentence-transformers pulls
+    # transformers + tokenizers + torch CPU automatically.  Pinning a
+    # floor that matches the v2.x line keeps the Hugging Face hub API
+    # contract stable.
+    "sentence-transformers>=2.2.0",
+    # numpy is a transitive dep of sentence-transformers, but list it
+    # explicitly so a future version pin lives next to the model code
+    # that consumes it (rather than buried in transformers).
+    "numpy>=1.24.0",
+]
 
 [project.scripts]
 lcp-rest = "lcp.api.rest.main:run"
