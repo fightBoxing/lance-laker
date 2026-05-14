@@ -165,6 +165,7 @@ async def rest_app(configured_settings: None, patch_jwks: None) -> AsyncIterator
         indexes,
         lifecycle,
         meta,
+        search,
         tasks,
         vectorization,
     )
@@ -186,6 +187,7 @@ async def rest_app(configured_settings: None, patch_jwks: None) -> AsyncIterator
     app.include_router(datasets.router)
     app.include_router(tasks.router)
     app.include_router(indexes.router)
+    app.include_router(search.router)
     app.include_router(lifecycle.router)
     app.include_router(vectorization.router)
     app.include_router(meta.router)

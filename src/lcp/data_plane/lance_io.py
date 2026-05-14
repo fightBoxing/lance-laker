@@ -67,6 +67,7 @@ __all__ = [
     "create_index",
     "add_columns_from_func",
     "count_rows",
+    "vector_search",
     "CompactionStats",
 ]
 
@@ -477,3 +478,85 @@ def _maybe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Vector search
+# ---------------------------------------------------------------------------
+
+
+def vector_search(
+    uri: str,
+    *,
+    vector: list[float],
+    column: str,
+    k: int = 10,
+    filter_expr: str | None = None,
+    select_columns: list[str] | None = None,
+    nprobes: int | None = None,
+    refine_factor: int | None = None,
+    storage_options: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Run an ANN (or flat-scan) vector search on a lance dataset.
+
+    Wraps ``ds.search(vector).limit(k)...to_list()`` with the same
+    storage_options plumbing as the rest of this module.  Lance
+    automatically uses the best available index on ``column``; if no
+    index exists it falls back to a brute-force scan.
+
+    Parameters
+    ----------
+    vector : list[float]
+        Query vector.  Must match the dimensionality of ``column``.
+    column : str
+        Name of the vector column to search.
+    k : int
+        Number of nearest neighbours to return (default 10).
+    filter_expr : str | None
+        Optional lance SQL filter applied *after* the ANN retrieval
+        (post-filter).  Example: ``"category = 'tech'"``.
+    select_columns : list[str] | None
+        Columns to include in the result rows.  ``None`` means all.
+    nprobes : int | None
+        IVF probe count override (higher = more accurate, slower).
+    refine_factor : int | None
+        Re-ranking factor (reads ``refine_factor * k`` candidates from
+        the index then re-ranks by exact distance).
+    storage_options : dict[str, str] | None
+        S3 / MinIO credentials dict (same as other helpers).
+
+    Returns
+    -------
+    list[dict[str, Any]]
+        Each dict is one result row with a ``_distance`` key plus the
+        selected columns.  Ordered by ascending distance.
+
+    Raises
+    ------
+    ValueError
+        If ``column`` does not exist in the dataset schema or the
+        vector dimensionality does not match.
+    """
+
+    ds = open_dataset(uri, storage_options=storage_options)
+
+    # Validate column exists and is a vector type.
+    schema = ds.schema
+    if column not in schema.names:
+        raise ValueError(
+            f"Vector column {column!r} not found in dataset schema; "
+            f"available={sorted(schema.names)!r}",
+        )
+
+    query = ds.search(vector, vector_column_name=column).limit(k)
+
+    if filter_expr is not None:
+        query = query.where(filter_expr)
+    if select_columns is not None:
+        query = query.select(select_columns)
+    if nprobes is not None:
+        query = query.nprobes(nprobes)
+    if refine_factor is not None:
+        query = query.refine_factor(refine_factor)
+
+    return query.to_list()

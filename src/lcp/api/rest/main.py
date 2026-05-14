@@ -15,6 +15,7 @@ from lcp.api.rest.routers import (
     indexes,
     lifecycle,
     meta,
+    search,
     tasks,
     vectorization,
 )
@@ -68,6 +69,7 @@ def create_app() -> FastAPI:
     app.include_router(datasets.router)
     app.include_router(tasks.router)
     app.include_router(indexes.router)
+    app.include_router(search.router)
     app.include_router(lifecycle.router)
     app.include_router(vectorization.router)
     app.include_router(meta.router)
