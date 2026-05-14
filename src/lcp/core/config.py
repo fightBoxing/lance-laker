@@ -117,6 +117,36 @@ class Settings(BaseSettings):
     # off when pointing at AWS.
     lance_storage_path_style: bool = True
 
+    # -- Gravitino metadata catalog -----------------------------------------
+    # The control plane reconciles MySQL ``dataset`` rows against a remote
+    # Gravitino instance.  Empty default means "feature off" so unit tests
+    # and skeleton deployments do not require a live Gravitino server.
+    #
+    # Naming follows ``LCP_GRAVITINO_*`` env-prefix convention; ``url`` keeps
+    # parity with the upstream client config field (``GRAVITINO_URL``).
+    gravitino_url: str = Field(
+        default="",
+        description="Gravitino REST endpoint, e.g. http://gravitino:8090",
+    )
+    gravitino_metalake: str = Field(
+        default="lance_laker",
+        description="Metalake under which Lance fileset catalogs live",
+    )
+    gravitino_catalog: str = Field(
+        default="lance_oss",
+        description="Fileset catalog name; must already exist in Gravitino",
+    )
+    # Auth: ``none`` = no header (dev / in-cluster).  ``bearer`` reads the
+    # token from ``LCP_GRAVITINO_TOKEN``.  Other modes (basic, oauth2 client
+    # credentials) are deferred until a real deployment requires them; the
+    # client raises ``NotImplementedError`` so production cannot silently
+    # drop auth.
+    gravitino_auth_type: str = Field(default="none", description="none|bearer")
+    gravitino_token: str = Field(default="", description="Bearer token, if any")
+    # Per-request HTTP timeout; Gravitino lookups are usually <50ms but we
+    # leave headroom for cold starts.
+    gravitino_request_timeout_seconds: float = 5.0
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
