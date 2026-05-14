@@ -1,4 +1,5 @@
-"""beta.2a in-cluster smoke: full lance read/write loop for VECTORIZE.
+"""beta.2a/β.3 in-cluster smoke: full lance read/write loop for VECTORIZE
++ auto-index-build.
 
 Goal (Karpathy rule 4): prove the embedding pipeline, end-to-end:
 
@@ -9,6 +10,10 @@ Goal (Karpathy rule 4): prove the embedding pipeline, end-to-end:
                                   on-disk lance dataset, encodes via the
                                   real model, writes a fixed-size float32
                                   vector list back to the target column
+  - auto-index-build (β.3)     -- EmbeddingExecutor auto-submits an
+                                  INDEX_BUILD task when rule.extra has
+                                  index_config.auto_build=true; the worker
+                                  picks it up and creates a lance ANN index
 
 Bypasses the REST/auth layer because the cluster has no IdP -- the REST
 surface is already covered by 342 unit tests.
@@ -27,12 +32,16 @@ Steps:
   2.   seed a 5-row lance dataset on s3://lcp-lance/smoke/vec/t_<ts>
   3.   dataset_service.create_dataset                 -> dataset_uuid
   4.   vectorization_service.create_rule(target=v)    -> rule.id
+       (with extra.index_config.auto_build=true)
   5.   vectorization_service.submit_vectorize_task    -> task_uuid
   6.   submit_vectorize_task again                    -> idempotent
   7.   poll task_service.get_task                     -> SUCCEEDED
   8.   re-open the lance dataset                      -> v column exists,
                                                         5 rows, 384-d
   9.   set_enabled(False) + submit                    -> RuleDisabledError
+  10.  find INDEX_BUILD task auto-submitted by β.3    -> exists, PENDING
+  11.  poll INDEX_BUILD task until terminal           -> SUCCEEDED
+  12.  re-open lance dataset, list_indices()          -> index present
 
 Anything that prints "FAIL" is a real-cluster regression in slice 3 / 4.
 """
@@ -51,6 +60,9 @@ from lcp.data_plane import lance_io
 from lcp.db.session import get_session_factory
 from lcp.schemas.dataset import DatasetRegisterRequest
 from lcp.schemas.vectorization import RuleCreateRequest
+from sqlalchemy import select
+
+from lcp.db.models import Task as TaskModel
 from lcp.services import dataset_service, task_service, vectorization_service
 
 TENANT = "t-smoke-vec"
@@ -130,7 +142,7 @@ async def main() -> int:
         print(f"OK dataset_uuid={ds_uuid}", flush=True)
 
     # ---- step 4: create vectorization_rule -----------------------------
-    _step(4, "create vectorization_rule")
+    _step(4, "create vectorization_rule (with index_config.auto_build=true)")
     async with factory() as session:
         rule = await vectorization_service.create_rule(
             session,
@@ -140,12 +152,18 @@ async def main() -> int:
                 "source_columns": ["title"],
                 "model_name": "sentence-transformers/all-MiniLM-L6-v2",
                 "model_version": "1",
+                "extra": {
+                    "index_config": {
+                        "auto_build": True,
+                        "index_type": "IVF_PQ",
+                    },
+                },
             }),
         )
         rule_id = rule.id
         print(
             f"OK rule.id={rule_id} enabled={rule.enabled} "
-            f"target={rule.target_column}",
+            f"target={rule.target_column} extra={rule.extra}",
             flush=True,
         )
 
@@ -244,6 +262,70 @@ async def main() -> int:
         else:
             print("FAIL expected RuleDisabledError, got nothing", flush=True)
             return 1
+
+    # ---- step 10: find INDEX_BUILD task auto-submitted by β.3 ----------
+    _step(10, "find INDEX_BUILD task auto-submitted by EmbeddingExecutor")
+    index_build_task_uuid = None
+    async with factory() as session:
+        stmt = select(TaskModel).where(
+            TaskModel.task_type == "INDEX_BUILD",
+            TaskModel.dataset_uuid == ds_uuid,
+        )
+        ib_task = (await session.execute(stmt)).scalar_one_or_none()
+        if ib_task is None:
+            print("FAIL INDEX_BUILD task not found (β.3 auto-submit failed)", flush=True)
+            return 1
+        index_build_task_uuid = ib_task.task_uuid
+        print(
+            f"OK INDEX_BUILD task found: uuid={index_build_task_uuid} "
+            f"status={ib_task.status} params={ib_task.params}",
+            flush=True,
+        )
+        assert ib_task.params["index_name"] == "idx_v", ib_task.params
+
+    # ---- step 11: poll INDEX_BUILD task until terminal ------------------
+    _step(11, "poll INDEX_BUILD task until terminal")
+    deadline = time.time() + 120
+    ib_final_status = None
+    while time.time() < deadline:
+        async with factory() as session:
+            cur = await task_service.get_task(session, index_build_task_uuid)
+            print(f"  status={cur.status} updated_at={cur.updated_at}", flush=True)
+            if cur.status in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                ib_final_status = cur.status
+                ib_result = cur.result
+                ib_error = cur.error_message
+                break
+        await asyncio.sleep(2)
+    if ib_final_status is None:
+        print("FAIL INDEX_BUILD task did not reach terminal in 120s", flush=True)
+        return 1
+    print(
+        f"OK INDEX_BUILD final_status={ib_final_status} result={ib_result} "
+        f"error={ib_error}",
+        flush=True,
+    )
+    if ib_final_status != "SUCCEEDED":
+        print("FAIL INDEX_BUILD final_status != SUCCEEDED", flush=True)
+        return 1
+
+    # ---- step 12: verify lance index exists on disk --------------------
+    _step(12, "re-read lance dataset, verify ANN index present")
+    ds_indexed = lance.dataset(storage_uri, storage_options=storage_options)
+    indices = ds_indexed.list_indices()
+    print(f"OK lance indices={indices}", flush=True)
+    if not indices:
+        print("FAIL no indices found on lance dataset after INDEX_BUILD", flush=True)
+        return 1
+    # At least one index should cover the 'v' column.
+    v_indexed = any(
+        idx.get("columns") == ["v"] or idx.get("column") == "v"
+        for idx in indices
+    ) if isinstance(indices[0], dict) else len(indices) > 0
+    if not v_indexed:
+        print("FAIL no index covers column 'v'", flush=True)
+        return 1
+    print("OK ANN index on column 'v' confirmed", flush=True)
 
     print("\n=== ALL STEPS PASSED ===", flush=True)
     return 0
