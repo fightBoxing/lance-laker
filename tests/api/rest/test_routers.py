@@ -1170,7 +1170,280 @@ class TestRouteTableContract:
             "/v1/meta/sync",
             "/v1/meta/sync/{run_id}",
             "/v1/meta/datasets/{dataset_id}/snapshot",
+            "/v1/datasets/{dataset_uuid}/search",
             "/healthz",
         }
         missing = expected_subset - paths
         assert not missing, f"routes missing from app: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# search
+# ---------------------------------------------------------------------------
+
+
+class TestSearchRouter:
+    """Integration tests for ``POST /v1/datasets/{uuid}/search``.
+
+    The lance layer (search_service.search) is monkey-patched so these
+    tests exercise the HTTP contract without needing a real lance dataset.
+    """
+
+    _SEARCH_RESULTS = [
+        {"_distance": 0.05, "id": 1, "title": "hello"},
+        {"_distance": 0.42, "id": 2, "title": "world"},
+    ]
+
+    async def _create_dataset(
+        self, http_client: Any, token: str, *, table: str = "t_search",
+    ) -> str:
+        resp = await http_client.post(
+            "/v1/datasets",
+            headers=_auth(token),
+            json={
+                "catalog": "c",
+                "schema": "s",
+                "table": table,
+                "storage_uri": "s3://b/p",
+            },
+        )
+        return resp.json()["dataset_uuid"]
+
+    # -- happy path --------------------------------------------------------
+
+    async def test_search_returns_200(
+        self,
+        http_client: Any,
+        issue_token: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        token = issue_token(tenant_id="t-search-ok")
+        ds_uuid = await self._create_dataset(http_client, token)
+
+        async def _fake_search(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return list(self._SEARCH_RESULTS)
+
+        monkeypatch.setattr(
+            "lcp.services.search_service.search", _fake_search,
+        )
+
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={"vector": [0.1, 0.2, 0.3], "column": "v", "k": 5},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["count"] == 2
+        assert body["column"] == "v"
+        assert body["k"] == 5
+        assert len(body["results"]) == 2
+        assert body["results"][0]["_distance"] == 0.05
+
+    # -- dataset not found -------------------------------------------------
+
+    async def test_search_unknown_dataset_returns_404(
+        self,
+        http_client: Any,
+        issue_token: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lcp.services import dataset_service
+
+        token = issue_token(tenant_id="t-search-404")
+
+        async def _raise(*args: Any, **kwargs: Any) -> None:
+            raise dataset_service.DatasetNotFoundError("not found")
+
+        monkeypatch.setattr(
+            "lcp.services.search_service.search", _raise,
+        )
+
+        resp = await http_client.post(
+            "/v1/datasets/no-such-uuid/search",
+            headers=_auth(token),
+            json={"vector": [0.1], "column": "v"},
+        )
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "NOT_FOUND"
+
+    # -- column not found --------------------------------------------------
+
+    async def test_search_bad_column_returns_400(
+        self,
+        http_client: Any,
+        issue_token: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lcp.services import search_service as ss
+
+        token = issue_token(tenant_id="t-search-col")
+        ds_uuid = await self._create_dataset(
+            http_client, token, table="t_search_col",
+        )
+
+        async def _raise(*args: Any, **kwargs: Any) -> None:
+            raise ss.ColumnNotFoundError("column 'bad' not found")
+
+        monkeypatch.setattr(
+            "lcp.services.search_service.search", _raise,
+        )
+
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={"vector": [0.1], "column": "bad"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["code"] == "COLUMN_NOT_FOUND"
+
+    # -- dimension mismatch ------------------------------------------------
+
+    async def test_search_dim_mismatch_returns_400(
+        self,
+        http_client: Any,
+        issue_token: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from lcp.services import search_service as ss
+
+        token = issue_token(tenant_id="t-search-dim")
+        ds_uuid = await self._create_dataset(
+            http_client, token, table="t_search_dim",
+        )
+
+        async def _raise(*args: Any, **kwargs: Any) -> None:
+            raise ss.DimensionMismatchError("expected 384, got 3")
+
+        monkeypatch.setattr(
+            "lcp.services.search_service.search", _raise,
+        )
+
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={"vector": [0.1, 0.2, 0.3], "column": "v"},
+        )
+        assert resp.status_code == 400
+        assert resp.json()["detail"]["code"] == "DIMENSION_MISMATCH"
+
+    # -- request validation ------------------------------------------------
+
+    async def test_search_empty_vector_returns_422(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-search-val")
+        ds_uuid = await self._create_dataset(
+            http_client, token, table="t_search_val",
+        )
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={"vector": [], "column": "v"},
+        )
+        assert resp.status_code == 422
+
+    async def test_search_missing_column_returns_422(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-search-val2")
+        ds_uuid = await self._create_dataset(
+            http_client, token, table="t_search_val2",
+        )
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={"vector": [0.1]},
+        )
+        assert resp.status_code == 422
+
+    async def test_search_k_out_of_range_returns_422(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-search-val3")
+        ds_uuid = await self._create_dataset(
+            http_client, token, table="t_search_val3",
+        )
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={"vector": [0.1], "column": "v", "k": 0},
+        )
+        assert resp.status_code == 422
+
+    async def test_search_extra_field_returns_422(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-search-val4")
+        ds_uuid = await self._create_dataset(
+            http_client, token, table="t_search_val4",
+        )
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={"vector": [0.1], "column": "v", "bogus": True},
+        )
+        assert resp.status_code == 422
+
+    # -- optional params forwarded -----------------------------------------
+
+    async def test_search_with_all_optional_params(
+        self,
+        http_client: Any,
+        issue_token: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        token = issue_token(tenant_id="t-search-opts")
+        ds_uuid = await self._create_dataset(
+            http_client, token, table="t_search_opts",
+        )
+
+        captured: dict[str, Any] = {}
+
+        async def _capture(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            captured.update(kwargs)
+            return list(self._SEARCH_RESULTS)
+
+        monkeypatch.setattr(
+            "lcp.services.search_service.search", _capture,
+        )
+
+        resp = await http_client.post(
+            f"/v1/datasets/{ds_uuid}/search",
+            headers=_auth(token),
+            json={
+                "vector": [0.1, 0.2],
+                "column": "v",
+                "k": 20,
+                "filter": "category = 'tech'",
+                "select": ["id", "title"],
+                "nprobes": 32,
+                "refine_factor": 5,
+            },
+        )
+        assert resp.status_code == 200
+        assert captured["column"] == "v"
+        assert captured["k"] == 20
+        assert captured["filter_expr"] == "category = 'tech'"
+        assert captured["select_columns"] == ["id", "title"]
+        assert captured["nprobes"] == 32
+        assert captured["refine_factor"] == 5
+
+    # -- auth required -----------------------------------------------------
+
+    async def test_search_without_auth_returns_401(
+        self, http_client: Any,
+    ) -> None:
+        resp = await http_client.post(
+            "/v1/datasets/any-uuid/search",
+            json={"vector": [0.1], "column": "v"},
+        )
+        assert resp.status_code == 401
