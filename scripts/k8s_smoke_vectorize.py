@@ -14,9 +14,12 @@ Goal (Karpathy rule 4): prove the embedding pipeline, end-to-end:
                                   INDEX_BUILD task when rule.extra has
                                   index_config.auto_build=true; the worker
                                   picks it up and creates a lance ANN index
+  - ANN search (β.4)           -- search_service.search runs a top-k
+                                  nearest-neighbour query against the
+                                  indexed vector column
 
 Bypasses the REST/auth layer because the cluster has no IdP -- the REST
-surface is already covered by 342 unit tests.
+surface is already covered by 353+ unit tests.
 
 Storage:
   Uses the cluster MinIO bucket via ``s3://lcp-lance/...``.  The
@@ -42,6 +45,7 @@ Steps:
   10.  find INDEX_BUILD task auto-submitted by β.3    -> exists, PENDING
   11.  poll INDEX_BUILD task until terminal           -> SUCCEEDED
   12.  re-open lance dataset, list_indices()          -> index present
+  13.  search_service.search(vector, column='v', k=3) -> top-k results
 
 Anything that prints "FAIL" is a real-cluster regression in slice 3 / 4.
 """
@@ -63,7 +67,7 @@ from lcp.schemas.vectorization import RuleCreateRequest
 from sqlalchemy import select
 
 from lcp.db.models import Task as TaskModel
-from lcp.services import dataset_service, task_service, vectorization_service
+from lcp.services import dataset_service, search_service, task_service, vectorization_service
 
 TENANT = "t-smoke-vec"
 
@@ -326,6 +330,53 @@ async def main() -> int:
         print("FAIL no index covers column 'v'", flush=True)
         return 1
     print("OK ANN index on column 'v' confirmed", flush=True)
+
+    # ---- step 13: vector search via search_service (β.4) ---------------
+    _step(13, "vector search via search_service (β.4 ANN search)")
+    # Use the first row's vector as the query vector to do a self-search.
+    # Read the 'v' column from the lance dataset to get a real 384-d vector.
+    sample_table = ds_indexed.to_table(columns=["v"], limit=1)
+    query_vector = sample_table.column("v")[0].as_py()
+    print(f"OK query_vector dim={len(query_vector)}", flush=True)
+    assert len(query_vector) == 384, f"expected 384-d, got {len(query_vector)}"
+
+    async with factory() as session:
+        search_results = await search_service.search(
+            session,
+            dataset_uuid=ds_uuid,
+            vector=query_vector,
+            column="v",
+            k=3,
+        )
+    print(f"OK search returned {len(search_results)} results", flush=True)
+    if not search_results:
+        print("FAIL search returned 0 results", flush=True)
+        return 1
+    if len(search_results) > 3:
+        print(
+            f"FAIL search returned {len(search_results)} results, want <= 3",
+            flush=True,
+        )
+        return 1
+    # Every result must have a _distance key.
+    for i, row in enumerate(search_results):
+        if "_distance" not in row:
+            print(f"FAIL result[{i}] missing '_distance' key: {row}", flush=True)
+            return 1
+    # The first result should be the query row itself (distance ≈ 0).
+    first_dist = search_results[0]["_distance"]
+    print(f"OK first result _distance={first_dist}", flush=True)
+    if first_dist > 0.01:
+        print(
+            f"WARN first result distance={first_dist} > 0.01 "
+            "(expected near-zero for self-search)",
+            flush=True,
+        )
+    print(
+        f"OK vector search returned {len(search_results)} results, "
+        f"all with _distance field",
+        flush=True,
+    )
 
     print("\n=== ALL STEPS PASSED ===", flush=True)
     return 0
