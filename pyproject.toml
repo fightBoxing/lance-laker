@@ -60,6 +60,7 @@ lance = [
 ]
 
 [project.scripts]
+lcp-server = "lcp.api.unified_server:run"
 lcp-rest = "lcp.api.rest.main:run"
 lcp-grpc = "lcp.api.grpc.server:run"
 

@@ -306,10 +306,11 @@ class TestIndexOptimizeExecutor:
 
 class TestDefaultRegistry:
 
-    def test_registry_has_four_known_types(self) -> None:
+    def test_registry_has_five_known_types(self) -> None:
         registry = build_default_registry()
         assert set(registry) == {
             "TTL_DELETE", "COMPACTION", "INDEX_BUILD", "INDEX_OPTIMIZE",
+            "VECTORIZE",
         }
 
     def test_registry_returns_fresh_instances_each_call(self) -> None:

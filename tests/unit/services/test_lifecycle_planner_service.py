@@ -162,7 +162,7 @@ class TestPlannerEmission:
         # idempotency_key must encode policy.id + day bucket.
         assert tasks[0].idempotency_key is not None
         assert tasks[0].idempotency_key.startswith(
-            f"lifecycle:{policy.id}:TTL_DELETE:",
+            f"acme:lifecycle:{policy.id}:TTL_DELETE:",
         )
 
     async def test_full_policy_emits_three_tasks(

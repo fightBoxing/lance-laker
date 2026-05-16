@@ -294,11 +294,14 @@ async def claim_next_task(
     # Dispatchable tasks are PENDING (fresh) or QUEUED (a previous claim
     # that did not transition to RUNNING for any reason).  We sort by
     # priority (lower = more urgent) then by created_at so older tasks
-    # don't starve.
+    # don't starve.  Tasks that have exhausted their retry budget are
+    # excluded — they should not be dispatched again until an explicit
+    # ``retry_task`` call resets them.
     base_stmt: Select[Any] = (
         select(Task)
         .where(
             or_(Task.status == _PENDING, Task.status == _QUEUED),
+            Task.attempt < Task.max_attempts,
         )
         .order_by(Task.priority.asc(), Task.created_at.asc())
         .limit(1)
@@ -423,11 +426,19 @@ async def reap_dead_workers(
 
     # 1) Find candidates: ALIVE / DRAINING workers whose last heartbeat
     #    predates the cutoff.  DEAD workers are skipped (already reaped).
-    stale_stmt: Select[Any] = select(WorkerRegistry).where(
-        and_(
-            WorkerRegistry.status != _DEAD,
-            WorkerRegistry.last_heartbeat_at < cutoff,
-        ),
+    #    FOR UPDATE prevents concurrent reapers from processing the same
+    #    worker and re-queueing its tasks twice.  SKIP LOCKED ensures a
+    #    second reaper skips rows already locked by the first, so each
+    #    stale worker is processed exactly once.
+    stale_stmt: Select[Any] = (
+        select(WorkerRegistry)
+        .where(
+            and_(
+                WorkerRegistry.status != _DEAD,
+                WorkerRegistry.last_heartbeat_at < cutoff,
+            ),
+        )
+        .with_for_update(skip_locked=True)
     )
     stale_workers = (await session.execute(stale_stmt)).scalars().all()
     reaped_ids: list[str] = []
@@ -439,8 +450,12 @@ async def reap_dead_workers(
         #    consuming it would punish workers that crash through no
         #    fault of their own, and the retry/cancellation policy is the
         #    user's job (not the reaper's).
-        running_stmt: Select[Any] = select(Task).where(
-            and_(Task.worker_id == worker.worker_id, Task.status == _RUNNING),
+        running_stmt: Select[Any] = (
+            select(Task)
+            .where(
+                and_(Task.worker_id == worker.worker_id, Task.status == _RUNNING),
+            )
+            .with_for_update()
         )
         running_tasks = (await session.execute(running_stmt)).scalars().all()
         for task in running_tasks:

@@ -1,38 +1,51 @@
 ---
-# REST API Deployment.
+# LCP unified server (REST + gRPC) Deployment.
 #
-# 1 replica is enough for dev; the API is stateless so HPA-friendly later.
-# Resources kept tiny so the whole LCP stack co-exists with ray/fluss/daft
-# on a single Colima node.
+# Single image, single process: ``lcp-server`` runs both the REST API
+# (port 8080) and the gRPC server (port 50051) inside one asyncio event
+# loop.  Stateless — safe to HPA-scale.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: lcp-api
+  name: lcp-server
   namespace: lcp
   labels:
-    app.kubernetes.io/name: lcp-api
-    app.kubernetes.io/component: api
+    app.kubernetes.io/name: lcp-server
+    app.kubernetes.io/component: server
     app.kubernetes.io/part-of: lcp
 spec:
-  replicas: 1
+  # 2 replicas: eliminates SPOF during node drain / rolling deploy.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: lcp-api
+      app.kubernetes.io/name: lcp-server
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: lcp-api
-        app.kubernetes.io/component: api
+        app.kubernetes.io/name: lcp-server
+        app.kubernetes.io/component: server
         app.kubernetes.io/part-of: lcp
     spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: lcp-server
+                topologyKey: kubernetes.io/hostname
       containers:
-        - name: api
+        - name: server
           image: lcp:dev
-          # Pull policy:
-          # - dev: IfNotPresent so kubelet uses the locally-built image
-          #   in the docker daemon (Colima -> cri-dockerd shares it);
-          # - prod: Always with a real registry tag.
           imagePullPolicy: IfNotPresent
+          # Dockerfile CMD is already ``lcp-server --insecure``; override
+          # args here when mTLS is ready (remove --insecure).
           envFrom:
             - configMapRef:
                 name: lcp-config
@@ -41,12 +54,22 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-          # /healthz is implemented in src/lcp/api/rest/main.py and is
-          # cheap (no DB hit), so we use it for both probes.  initialDelay
-          # is generous to let the OIDC middleware warm up jwks fetcher.
-          readinessProbe:
+            - name: grpc
+              containerPort: 50051
+          # Probes target the REST /healthz (liveness) and /readyz
+          # (readiness, includes DB ping).  gRPC health is implicitly
+          # covered — both run in the same process, so if the REST
+          # surface is healthy the gRPC surface is too.
+          startupProbe:
             httpGet:
               path: /healthz
+              port: http
+            failureThreshold: 12
+            periodSeconds: 5
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
@@ -71,19 +94,19 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: lcp-api
+  name: lcp-server
   namespace: lcp
   labels:
-    app.kubernetes.io/name: lcp-api
+    app.kubernetes.io/name: lcp-server
 spec:
   type: NodePort
   selector:
-    app.kubernetes.io/name: lcp-api
+    app.kubernetes.io/name: lcp-server
   ports:
     - name: http
       port: 8080
       targetPort: http
-      # Pinned NodePort 30808 so curl http://127.0.0.1:30808/healthz works
-      # without re-running `kubectl get svc`.  Range 30000-32767 is the
-      # k8s NodePort default.
       nodePort: 30808
+    - name: grpc
+      port: 50051
+      targetPort: grpc

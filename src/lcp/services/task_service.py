@@ -82,17 +82,31 @@ async def submit_task(
     Returns ``(task, created)`` so the router can reply ``202 Accepted`` for a
     fresh submission and ``200 OK`` for an idempotent replay (same key).
     The flag mirrors the ``Created? bool`` pattern used by Kubernetes ``apply``.
+
+    The ``idempotency_key`` is automatically scoped to the current tenant by
+    prefixing ``<tenant_id>:`` before storing.  This prevents cross-tenant
+    collisions on the global UNIQUE constraint — two tenants using the same
+    logical key each get their own task row, and the IntegrityError fallback
+    path always finds the right row via the RLS-filtered re-SELECT.
     """
 
     principal = require_current_tenant()
+
+    # Scope the key to the current tenant so the global UNIQUE constraint
+    # can never collide across tenants.
+    scoped_key = (
+        f"{principal.tenant_id}:{idempotency_key}"
+        if idempotency_key is not None
+        else None
+    )
 
     # Idempotency check: if a task with the same key already exists, return it
     # (and do NOT insert a duplicate).  We do this *before* the INSERT to give
     # callers a clean ``200 OK`` path; we still rely on the unique constraint
     # as the last line of defence in case of a race.
-    if idempotency_key is not None:
+    if scoped_key is not None:
         existing_stmt: Select[Any] = select(Task).where(
-            Task.idempotency_key == idempotency_key,
+            Task.idempotency_key == scoped_key,
         )
         existing = (await session.execute(existing_stmt)).scalar_one_or_none()
         if existing is not None:
@@ -106,7 +120,7 @@ async def submit_task(
         status="PENDING",
         priority=priority,
         params=params,
-        idempotency_key=idempotency_key,
+        idempotency_key=scoped_key,
         max_attempts=max_attempts,
     )
     session.add(obj)
@@ -117,10 +131,10 @@ async def submit_task(
         # between the SELECT above and our INSERT.  Re-read and return the
         # winning row instead of surfacing a 500.
         await session.rollback()
-        if idempotency_key is None:  # pragma: no cover - DDL has no other unique
+        if scoped_key is None:  # pragma: no cover - DDL has no other unique
             raise
         retry_stmt: Select[Any] = select(Task).where(
-            Task.idempotency_key == idempotency_key,
+            Task.idempotency_key == scoped_key,
         )
         winner = (await session.execute(retry_stmt)).scalar_one_or_none()
         if winner is None:  # pragma: no cover - extremely unlikely
@@ -204,7 +218,14 @@ async def cancel_task(session: AsyncSession, task_uuid: str) -> Task:
     Idempotent: cancelling an already-cancelled task is a no-op (returns the
     same row).  Cancelling a SUCCEEDED / FAILED task raises
     :class:`TaskTransitionError` so the router can return 409.
+
+    When the task is in ``RUNNING`` state and has a ``worker_id``, the
+    worker's ``in_flight`` counter is decremented atomically so the
+    scheduler's capacity tracking stays accurate.
     """
+
+    # Import here to avoid a circular dependency at module level.
+    from lcp.services import scheduler_service
 
     obj = await get_task(session, task_uuid)
     if obj.status == "CANCELLED":
@@ -213,6 +234,10 @@ async def cancel_task(session: AsyncSession, task_uuid: str) -> Task:
         raise TaskTransitionError(
             f"task {task_uuid} is in terminal state {obj.status!r} and cannot be cancelled",
         )
+    # If the task was already dispatched to a worker, release the slot so the
+    # scheduler does not think the worker is at capacity when it is not.
+    if obj.status == "RUNNING" and obj.worker_id:
+        await scheduler_service._decrement_in_flight(session, obj.worker_id)
     obj.status = "CANCELLED"
     obj.finished_at = utcnow_naive()
     await session.commit()

@@ -47,8 +47,6 @@ USER lcp
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 EXPOSE 8080
-# Default to the REST API; planner / worker manifests override this.
-# Using the console script `lcp-rest` so the container picks up
-# LCP_REST_HOST / LCP_REST_PORT from env -- the manifest controls binding,
-# the image stays generic.
-CMD ["lcp-rest"]
+# Default to the unified server (REST + gRPC in one process).
+# The worker manifest overrides this with the lifecycle worker command.
+CMD ["lcp-server", "--insecure"]

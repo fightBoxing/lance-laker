@@ -151,7 +151,22 @@ def _resolve_principal(context: grpc.aio.ServicerContext) -> TenantPrincipal:
 
     # --- SPIFFE URI SAN (highest priority) ---
     for raw_uri in uri_san_values:
-        uri = raw_uri.decode("utf-8") if isinstance(raw_uri, bytes) else str(raw_uri)
+        # H-3: gRPC may deliver URI SAN values as raw bytes (DER-encoded
+        # extension content) or as pre-decoded strings depending on the
+        # grpcio version and the TLS backend.  A ``UnicodeDecodeError``
+        # here would produce a garbage ``uri`` string (mojibake) that
+        # silently falls through and picks the wrong tenant.  We skip
+        # any entry that cannot be decoded as UTF-8; a valid SPIFFE URI
+        # is always printable ASCII, so a decode failure means the value
+        # is either DER-encoded binary or malformed — neither is a SPIFFE
+        # URI we can trust.
+        if isinstance(raw_uri, bytes):
+            try:
+                uri = raw_uri.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        else:
+            uri = str(raw_uri)
         tenant_id = extract_tenant_from_spiffe_id(uri)
         if tenant_id is not None:
             return TenantPrincipal(
@@ -170,11 +185,23 @@ def _resolve_principal(context: grpc.aio.ServicerContext) -> TenantPrincipal:
 
 
 def _decode_first(values: list[Any]) -> str:
-    """Decode the first element of a gRPC auth-context value list."""
+    """Decode the first element of a gRPC auth-context value list.
+
+    gRPC may return DN attribute values (CN, O=) as ``bytes`` or as
+    ``str`` depending on the version and TLS backend.  We always decode
+    as UTF-8; a ``UnicodeDecodeError`` means the value is binary/DER
+    garbage, which we surface as an ``AuthenticationError`` rather than
+    letting the caller receive a garbled identity string.
+    """
 
     head = values[0]
     if isinstance(head, bytes):
-        return head.decode("utf-8")
+        try:
+            return head.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AuthenticationError(
+                f"Peer certificate attribute contains non-UTF-8 bytes: {exc}",
+            ) from exc
     return str(head)
 
 
