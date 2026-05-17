@@ -144,7 +144,7 @@ class TestCreateIndexEmitsBuildTask:
         # idempotency_key must encode the row id so a second create
         # (which would fail with IndexAlreadyExistsError anyway) can't
         # collide with another index's emit.
-        assert task.idempotency_key == f"build:{ds.dataset_uuid}/emb_idx:{idx.id}"
+        assert task.idempotency_key == f"{TENANT_ID}:build:{ds.dataset_uuid}/emb_idx:{idx.id}"
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +201,7 @@ class TestOptimizeIndexEmitsOptimizeTask:
         # window) but the next optimize -- after the row goes back to
         # READY and is optimized again -- does enqueue a fresh task.
         assert task.idempotency_key.startswith(
-            f"optimize:{ds.dataset_uuid}/{idx.index_name}:{idx.id}:",
+            f"{TENANT_ID}:optimize:{ds.dataset_uuid}/{idx.index_name}:{idx.id}:",
         )
 
     async def test_repeated_optimize_after_back_to_ready_emits_new_task(

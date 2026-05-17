@@ -72,12 +72,17 @@ async def create_dataset(
 
 
 async def get_dataset(session: AsyncSession, dataset_uuid: str) -> Dataset:
-    """Fetch one dataset by UUID; RLS hook adds the tenant filter."""
+    """Fetch one dataset by UUID; RLS hook adds the tenant filter.
+
+    A soft-deleted dataset (``status == "DELETED"``) is treated as
+    non-existent so downstream operations (index creation, policy
+    creation, etc.) cannot attach to a dataset that is being torn down.
+    """
 
     stmt = select(Dataset).where(Dataset.dataset_uuid == dataset_uuid)
     result = await session.execute(stmt)
     obj = result.scalar_one_or_none()
-    if obj is None:
+    if obj is None or obj.status == "DELETED":
         raise DatasetNotFoundError(dataset_uuid)
     return obj
 

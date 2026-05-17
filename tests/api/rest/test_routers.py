@@ -913,42 +913,44 @@ class TestVectorizationRouter:
 
 class TestMetaRouter:
 
-    async def test_trigger_meta_sync_returns_501(
+    async def test_trigger_meta_sync_returns_503_when_gravitino_disabled(
         self,
         http_client: Any,
         issue_token: Any,
     ) -> None:
+        """Without LCP_GRAVITINO_URL the sync endpoint returns 503."""
         token = issue_token(tenant_id="t-meta")
         resp = await http_client.post(
             "/v1/meta/sync",
             headers=_auth(token),
-            json={"dry_run": True},
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 503
+        body = resp.json()
+        assert body["detail"]["code"] == "GRAVITINO_DISABLED"
 
-    async def test_get_meta_sync_status_returns_501(
+    async def test_list_schemas_returns_503_when_gravitino_disabled(
         self,
         http_client: Any,
         issue_token: Any,
     ) -> None:
-        token = issue_token(tenant_id="t-meta-status")
+        token = issue_token(tenant_id="t-meta-schemas")
         resp = await http_client.get(
-            "/v1/meta/sync/run-1",
+            "/v1/meta/schemas",
             headers=_auth(token),
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 503
 
-    async def test_get_dataset_snapshot_returns_501(
+    async def test_write_back_returns_503_when_gravitino_disabled(
         self,
         http_client: Any,
         issue_token: Any,
     ) -> None:
-        token = issue_token(tenant_id="t-meta-snap")
-        resp = await http_client.get(
-            "/v1/meta/datasets/d-1/snapshot",
+        token = issue_token(tenant_id="t-meta-wb")
+        resp = await http_client.post(
+            "/v1/meta/datasets/d-1/write-back",
             headers=_auth(token),
         )
-        assert resp.status_code == 501
+        assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -983,8 +985,9 @@ class TestRouteTableContract:
             "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/enable",
             "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/disable",
             "/v1/meta/sync",
-            "/v1/meta/sync/{run_id}",
-            "/v1/meta/datasets/{dataset_id}/snapshot",
+            "/v1/meta/schemas",
+            "/v1/meta/schemas/{schema}/filesets",
+            "/v1/meta/datasets/{dataset_uuid}/write-back",
             "/healthz",
         }
         missing = expected_subset - paths

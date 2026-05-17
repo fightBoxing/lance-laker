@@ -108,10 +108,12 @@ def build_default_registry() -> dict[str, LifecycleExecutor]:
     from lcp.workers.executors.index_build import IndexBuildExecutor
     from lcp.workers.executors.index_optimize import IndexOptimizeExecutor
     from lcp.workers.executors.ttl_delete import TtlDeleteExecutor
+    from lcp.workers.executors.vectorize import VectorizationExecutor
 
     return {
         TtlDeleteExecutor.task_type: TtlDeleteExecutor(),
         CompactionExecutor.task_type: CompactionExecutor(),
         IndexBuildExecutor.task_type: IndexBuildExecutor(),
         IndexOptimizeExecutor.task_type: IndexOptimizeExecutor(),
+        VectorizationExecutor.task_type: VectorizationExecutor(),
     }

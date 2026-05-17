@@ -110,6 +110,52 @@ class Settings(BaseSettings):
     # off when pointing at AWS.
     lance_storage_path_style: bool = True
 
+    # -- Gravitino integration -------------------------------------------------
+    # Connection to a Gravitino metalake for schema/catalog discovery.
+    # Empty ``gravitino_url`` disables the integration (all meta-sync endpoints
+    # return 503).  This is intentional for dev environments that don't run a
+    # Gravitino server.
+    gravitino_url: str = Field(
+        default="",
+        description=(
+            "Gravitino REST endpoint, e.g. http://gravitino:8090. "
+            "Leave empty to disable Gravitino integration."
+        ),
+    )
+    gravitino_metalake: str = Field(
+        default="default",
+        description="Gravitino metalake name (logical namespace).",
+    )
+    gravitino_catalog: str = Field(
+        default="lance",
+        description="Catalog within the metalake that holds LanceDB filesets.",
+    )
+    gravitino_auth_token: str = Field(
+        default="",
+        description="Bearer token for Gravitino API auth (empty = no auth).",
+    )
+    gravitino_timeout_seconds: float = Field(
+        default=10.0,
+        description="HTTP timeout for Gravitino API calls.",
+    )
+
+    # -- Vectorization (Embedding) --------------------------------------------
+    # Default embedding service endpoint.  VectorizationRule rows can override
+    # this per-rule via ``model_endpoint``; this setting provides the fallback
+    # for rules that leave the field empty.
+    embedding_default_endpoint: str = Field(
+        default="",
+        description=(
+            "Default embedding model HTTP endpoint, e.g. "
+            "http://embedding-svc:8000/v1/embeddings. "
+            "Empty = vectorization disabled unless rule specifies endpoint."
+        ),
+    )
+    embedding_request_timeout_seconds: float = Field(
+        default=30.0,
+        description="HTTP timeout for embedding model calls.",
+    )
+
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
         """Warn on unrecognised ``LCP_``-prefixed environment variables.
 

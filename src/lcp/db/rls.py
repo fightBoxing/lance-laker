@@ -38,15 +38,17 @@ from lcp.core.tenant import get_current_tenant
 RLS_PROTECTED_TABLES: set[str] = {
     "dataset",
     "task",
-    # NOTE: ``vector_index`` and ``lifecycle_policy`` are intentionally NOT
-    # here.  Their DDL has no ``tenant_id`` column; tenancy is enforced in
-    # the corresponding service modules
+    # NOTE: ``vector_index``, ``lifecycle_policy``, and ``vectorization_rule``
+    # are intentionally NOT here.  Their DDL has no ``tenant_id`` column;
+    # tenancy is enforced in the corresponding service modules
     # (:mod:`lcp.services.index_service`,
-    # :mod:`lcp.services.lifecycle_service`) by loading the parent
+    # :mod:`lcp.services.lifecycle_service`,
+    # :mod:`lcp.services.vectorization_service`) by loading the parent
     # ``dataset`` first (which IS RLS-filtered).  Adding a name here would
     # cause the hook to inject ``<table>.tenant_id = ...`` and SQL-fail.
-    "compactions",
-    "embedding_jobs",
+    #
+    # Add new table names here ONLY when the ORM model has a real
+    # ``tenant_id`` column AND its ``__tablename__`` matches the entry.
 }
 
 
