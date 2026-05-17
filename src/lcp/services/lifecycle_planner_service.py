@@ -57,15 +57,16 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import Select, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from lcp.core.tenant import get_current_tenant
-from lcp.db.models import Dataset, LifecyclePolicy, Task
+from lcp.core.tenant import NotSystemPrincipalError, require_system_context
+from lcp.core.time import utcnow_naive
+from lcp.db.models import Dataset, Index, LifecyclePolicy, Task, VectorizationRule
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -75,6 +76,13 @@ from lcp.db.models import Dataset, LifecyclePolicy, Task
 TASK_TTL_DELETE = "TTL_DELETE"
 TASK_COMPACTION = "COMPACTION"
 TASK_INDEX_OPTIMIZE = "INDEX_OPTIMIZE"
+TASK_VECTORIZE = "VECTORIZE"
+
+# Delta threshold: when an index has accumulated this many deltas since
+# its last optimization, the planner auto-emits an INDEX_OPTIMIZE task
+# even if no cron is configured.  This provides "self-healing" index
+# maintenance without requiring the user to set a cron rule.
+_DEFAULT_DELTA_THRESHOLD = 10
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +90,12 @@ TASK_INDEX_OPTIMIZE = "INDEX_OPTIMIZE"
 # ---------------------------------------------------------------------------
 
 
-class PlannerNotSystemError(Exception):
-    """Raised when planner primitives run without a system principal."""
+class PlannerNotSystemError(NotSystemPrincipalError):
+    """Raised when planner primitives run without a system principal.
+
+    Subclasses :class:`lcp.core.tenant.NotSystemPrincipalError` so callers
+    can catch either the specific or generic form.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -109,20 +121,18 @@ class PlannerTick:
 # ---------------------------------------------------------------------------
 
 
-def _utcnow() -> datetime:
-    """Return naive UTC datetime that matches the DATETIME(3) columns."""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` is imported from ``lcp.core.time``.
 
 
 def _require_system() -> None:
-    """Refuse to run unless the caller bound a system principal."""
+    """Wrap :func:`require_system_context` to raise the planner-specific type."""
 
-    principal = get_current_tenant()
-    if principal is None or not getattr(principal, "is_system", False):
+    try:
+        require_system_context("lifecycle planner")
+    except NotSystemPrincipalError:
         raise PlannerNotSystemError(
             "lifecycle planner must run under with_system_context()",
-        )
+        ) from None
 
 
 def _day_bucket(now: datetime) -> str:
@@ -141,14 +151,17 @@ def _idempotency_key(
     policy_id: int,
     task_type: str,
     bucket: str,
+    tenant_id: str,
 ) -> str:
     """Compose a stable idempotency key for a planner-emitted task.
 
-    The format is ``lifecycle:<policy_id>:<task_type>:<bucket>`` and never
-    exceeds 128 characters (DDL limit).
+    The format is ``<tenant_id>:lifecycle:<policy_id>:<task_type>:<bucket>``
+    and never exceeds 128 characters (DDL limit).  The tenant prefix matches
+    the scoping that :func:`task_service.submit_task` applies so the global
+    UNIQUE constraint can never collide across tenants.
     """
 
-    return f"lifecycle:{policy_id}:{task_type}:{bucket}"
+    return f"{tenant_id}:lifecycle:{policy_id}:{task_type}:{bucket}"
 
 
 # ---------------------------------------------------------------------------
@@ -174,7 +187,7 @@ async def plan_once(
 
     _require_system()
     if now is None:
-        now = _utcnow()
+        now = utcnow_naive()
 
     policies = await _fetch_enabled_policies(session)
     emitted: list[str] = []
@@ -280,6 +293,90 @@ async def _plan_for_policy(
         elif new_uuid is not None:
             emitted.append(new_uuid)
 
+    # 3b. INDEX_OPTIMIZE auto-trigger by delta threshold — even without cron.
+    # When any index on this dataset accumulates deltas beyond the threshold,
+    # emit an optimize task.  The idempotency key is per-index per-hour so
+    # repeated ticks within the same hour are no-ops.
+    if not policy.index_optimize_cron:
+        idx_stmt: Select[Any] = (
+            select(Index)
+            .where(
+                Index.dataset_uuid == dataset.dataset_uuid,
+                Index.status == "READY",
+                Index.delta_count >= _DEFAULT_DELTA_THRESHOLD,
+            )
+        )
+        hot_indexes = (await session.execute(idx_stmt)).scalars().all()
+        for idx in hot_indexes:
+            idx_key = (
+                f"{dataset.tenant_id}:auto-optimize:"
+                f"{dataset.dataset_uuid}/{idx.index_name}:{_hour_bucket(now)}"
+            )
+            existing = (
+                await session.execute(
+                    select(Task.task_uuid).where(Task.idempotency_key == idx_key),
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                duplicates += 1
+                continue
+            task_uuid = str(uuid.uuid4())
+            task = Task(
+                task_uuid=task_uuid,
+                task_type=TASK_INDEX_OPTIMIZE,
+                dataset_uuid=dataset.dataset_uuid,
+                tenant_id=dataset.tenant_id,
+                status="PENDING",
+                priority=5,
+                idempotency_key=idx_key,
+                params={
+                    "index_name": idx.index_name,
+                    "policy_name": policy.policy_name,
+                    "trigger": "delta_threshold",
+                    "delta_count": idx.delta_count,
+                },
+                max_attempts=3,
+            )
+            session.add(task)
+            try:
+                await session.flush()
+                emitted.append(task_uuid)
+            except IntegrityError:
+                await session.rollback()
+                duplicates += 1
+
+    # 4. VECTORIZE -- for each enabled vectorization rule on this dataset.
+    vec_stmt: Select[Any] = (
+        select(VectorizationRule)
+        .where(
+            VectorizationRule.dataset_uuid == dataset.dataset_uuid,
+            VectorizationRule.enabled.is_(True),
+        )
+    )
+    vec_rules = (await session.execute(vec_stmt)).scalars().all()
+    for rule in vec_rules:
+        new_uuid, was_dup = await _try_emit_task(
+            session,
+            policy=policy,
+            dataset=dataset,
+            task_type=TASK_VECTORIZE,
+            bucket=_hour_bucket(now),
+            params={
+                "target_column": rule.target_column,
+                "source_columns": rule.source_columns,
+                "model_name": rule.model_name,
+                "model_version": rule.model_version,
+                "model_endpoint": rule.model_endpoint or "",
+                "batch_size": rule.batch_size,
+                "policy_name": policy.policy_name,
+                "rule_id": rule.id,
+            },
+        )
+        if was_dup:
+            duplicates += 1
+        elif new_uuid is not None:
+            emitted.append(new_uuid)
+
     # Record the planner's pass against this policy regardless of outcome
     # so operators can see "planner saw this policy at T".
     policy.last_run_at = now
@@ -301,7 +398,7 @@ async def _try_emit_task(
     Returns ``(task_uuid_or_None, was_duplicate)``.
     """
 
-    key = _idempotency_key(policy.id, task_type, bucket)
+    key = _idempotency_key(policy.id, task_type, bucket, dataset.tenant_id)
 
     # Cheap pre-check: if the key is already there, save a round-trip.
     existing_stmt: Select[Any] = select(Task.task_uuid).where(

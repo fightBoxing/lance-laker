@@ -22,11 +22,12 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import httpx
-from jose import jwt
-from jose.exceptions import JWTError
+import jwt
+from jwt import PyJWK
+from jwt.exceptions import PyJWTError
 
 from lcp.core.config import get_settings
 
@@ -36,6 +37,65 @@ if TYPE_CHECKING:
 
 class AuthenticationError(Exception):
     """Raised when an inbound credential cannot be validated."""
+
+
+# ---------------------------------------------------------------------------
+# JTI replay-defence interface (M-3)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class JtiDenylist(Protocol):
+    """Protocol for JWT ID (jti) replay-attack denial.
+
+    Callers call :meth:`is_denied` before trusting a token.  If the jti has
+    been seen before the implementation must return ``True`` and the token
+    should be rejected.  After accepting a token the caller must call
+    :meth:`deny` so subsequent presentations are blocked.
+
+    The no-op stub :class:`NoOpJtiDenylist` allows the server to start without
+    a persistent store.  Replace it with a Redis- or DB-backed implementation
+    in production to satisfy the replay-defence requirement in the security
+    design document.
+    """
+
+    async def is_denied(self, jti: str) -> bool:
+        """Return ``True`` if *jti* has already been used."""
+        ...
+
+    async def deny(self, jti: str, exp: int) -> None:
+        """Record *jti* as consumed until its expiry timestamp *exp*."""
+        ...
+
+
+class NoOpJtiDenylist:
+    """No-op :class:`JtiDenylist` — every token is accepted.
+
+    Suitable for development and test environments.  In production wire in
+    an implementation backed by a shared store (Redis, DB) to prevent token
+    replay across multiple API instances.
+    """
+
+    async def is_denied(self, jti: str) -> bool:  # noqa: ARG002
+        return False
+
+    async def deny(self, jti: str, exp: int) -> None:  # noqa: ARG002
+        pass
+
+
+_JTI_DENYLIST: JtiDenylist = NoOpJtiDenylist()
+
+
+def set_jti_denylist(denylist: JtiDenylist) -> None:
+    """Replace the module-level JTI denylist (call once at startup)."""
+
+    global _JTI_DENYLIST  # noqa: PLW0603
+    _JTI_DENYLIST = denylist
+
+
+# ---------------------------------------------------------------------------
+# JWKs cache
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -146,19 +206,29 @@ async def _get_jwks(settings: Settings, *, force_refresh: bool = False) -> _Jwks
             raise AuthenticationError(f"Unable to fetch JWKs: {exc}") from exc
 
 
+# ---------------------------------------------------------------------------
+# JWT validation
+# ---------------------------------------------------------------------------
+
+
 async def validate_oidc_jwt(token: str) -> dict[str, Any]:
     """Validate an OIDC JWT and return its claims.
 
     Performs signature, issuer, audience, expiry, ``iat``, and ``nbf`` checks
     with a configurable clock-skew leeway, and pins the algorithm allow-list
     to public-key families to defeat the ``alg=HS256`` confusion attack.
+
+    If the token carries a ``jti`` claim it is checked against the configured
+    :class:`JtiDenylist` to prevent replay attacks.  By default the no-op
+    denylist is active; wire in a persistent implementation via
+    :func:`set_jti_denylist` at startup.
     """
 
     settings = get_settings()
 
     try:
         unverified_header = jwt.get_unverified_header(token)
-    except JWTError as exc:
+    except PyJWTError as exc:
         raise AuthenticationError(f"Malformed JWT header: {exc}") from exc
 
     alg = unverified_header.get("alg")
@@ -173,42 +243,44 @@ async def validate_oidc_jwt(token: str) -> dict[str, Any]:
         raise AuthenticationError("JWT header is missing a string 'kid'")
 
     cache = await _get_jwks(settings)
-    key = cache.keys_by_kid.get(kid)
-    if key is None:
+    jwk_dict = cache.keys_by_kid.get(kid)
+    if jwk_dict is None:
         # Force one refresh in case the IdP rotated keys before TTL expired.
         cache = await _get_jwks(settings, force_refresh=True)
-        key = cache.keys_by_kid.get(kid)
-    if key is None:
+        jwk_dict = cache.keys_by_kid.get(kid)
+    if jwk_dict is None:
         raise AuthenticationError("Signing key not found in JWKs")
 
     try:
-        claims = jwt.decode(
+        signing_key = PyJWK.from_dict(jwk_dict).key
+    except (KeyError, ValueError, PyJWTError) as exc:
+        raise AuthenticationError(f"Cannot load signing key from JWK: {exc}") from exc
+
+    try:
+        claims: dict[str, Any] = jwt.decode(
             token,
-            key,
+            signing_key,
             algorithms=list(settings.oidc_allowed_algorithms),
             audience=settings.oidc_audience,
             issuer=settings.oidc_issuer,
+            leeway=settings.oidc_clock_skew_leeway_seconds,
             options={
-                # python-jose uses per-claim ``require_<name>`` flags rather
-                # than a generic ``require`` list.  Enumerate every claim that
-                # must be present so that a malformed token fails fast.
-                "require_iat": True,
-                "require_nbf": False,
-                "require_exp": True,
-                "require_aud": True,
-                "require_iss": True,
-                "require_sub": True,
-                "verify_iat": True,
-                "verify_nbf": True,
-                "verify_exp": True,
-                "verify_aud": True,
-                "verify_iss": True,
-                "verify_sub": False,
-                "leeway": settings.oidc_clock_skew_leeway_seconds,
+                # pyjwt uses a ``require`` list rather than per-claim flags.
+                # Enumerate every claim that must be present so that a
+                # malformed token fails fast.
+                "require": ["exp", "iat", "sub", "iss", "aud"],
             },
         )
-    except JWTError as exc:
+    except PyJWTError as exc:
         raise AuthenticationError(f"Invalid JWT: {exc}") from exc
+
+    # JTI replay check — no-op when no persistent denylist is configured.
+    jti = claims.get("jti")
+    if isinstance(jti, str) and jti:
+        if await _JTI_DENYLIST.is_denied(jti):
+            raise AuthenticationError("JWT ID (jti) has already been used (replay detected)")
+        await _JTI_DENYLIST.deny(jti, int(claims.get("exp", 0)))
+
     return claims
 
 
@@ -229,6 +301,34 @@ def extract_tenant_from_claims(claims: dict[str, Any]) -> str:
         "Unable to resolve tenant_id from JWT claims; "
         "set a 'tenant_id' (or 'org') claim in the IdP",
     )
+
+
+def extract_tenant_from_spiffe_id(spiffe_id: str) -> str | None:
+    """Extract a tenant id from a SPIFFE URI SAN (H-3).
+
+    LCP convention: ``spiffe://<trust-domain>/tenant/<tenant_id>[/…]``.
+    Returns ``None`` if *spiffe_id* is not a SPIFFE URI or does not follow
+    the expected path structure — callers should fall back to x509 subject
+    parsing in that case.
+
+    Examples::
+
+        >>> extract_tenant_from_spiffe_id("spiffe://lance/tenant/acme/worker/w-7")
+        'acme'
+        >>> extract_tenant_from_spiffe_id("spiffe://other/service/foo")
+        None
+    """
+
+    if not spiffe_id.startswith("spiffe://"):
+        return None
+    # Strip the scheme and split on "/"
+    # spiffe://trust-domain/tenant/<tenant_id>/...
+    path = spiffe_id[len("spiffe://"):]
+    parts = path.split("/")
+    # parts[0] = trust-domain, parts[1] = "tenant", parts[2] = tenant_id
+    if len(parts) >= 3 and parts[1] == "tenant" and parts[2]:
+        return parts[2]
+    return None
 
 
 def extract_tenant_from_x509_subject(subject_cn: str, organization: str | None) -> str:
@@ -254,3 +354,10 @@ def reset_jwks_cache_for_tests() -> None:
     global _JWKS_CACHE, _JWKS_REFRESH_LOCK  # noqa: PLW0603
     _JWKS_CACHE = None
     _JWKS_REFRESH_LOCK = None
+
+
+def reset_jti_denylist_for_tests() -> None:
+    """Reset the JTI denylist to the no-op implementation.  For tests only."""
+
+    global _JTI_DENYLIST  # noqa: PLW0603
+    _JTI_DENYLIST = NoOpJtiDenylist()

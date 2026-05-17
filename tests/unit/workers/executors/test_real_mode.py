@@ -61,8 +61,8 @@ async def session() -> AsyncIterator[AsyncSession]:
 def lance_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     """Force the executor onto the real-lance code path.
 
-    ``get_settings`` is ``lru_cache``d, so we replace the underlying
-    callable instead of mutating the cached object.
+    Each executor imports ``get_settings`` by name, so we replace the symbol
+    in each module rather than mutating the singleton directly.
     """
 
     from lcp.core.config import Settings

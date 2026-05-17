@@ -144,7 +144,7 @@ class TestCreateIndexEmitsBuildTask:
         # idempotency_key must encode the row id so a second create
         # (which would fail with IndexAlreadyExistsError anyway) can't
         # collide with another index's emit.
-        assert task.idempotency_key == f"build:{ds.dataset_uuid}/emb_idx:{idx.id}"
+        assert task.idempotency_key == f"{TENANT_ID}:build:{ds.dataset_uuid}/emb_idx:{idx.id}"
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +201,7 @@ class TestOptimizeIndexEmitsOptimizeTask:
         # window) but the next optimize -- after the row goes back to
         # READY and is optimized again -- does enqueue a fresh task.
         assert task.idempotency_key.startswith(
-            f"optimize:{ds.dataset_uuid}/{idx.index_name}:{idx.id}:",
+            f"{TENANT_ID}:optimize:{ds.dataset_uuid}/{idx.index_name}:{idx.id}:",
         )
 
     async def test_repeated_optimize_after_back_to_ready_emits_new_task(
@@ -275,3 +275,100 @@ class TestOptimizeIndexEmitsOptimizeTask:
             )
         ).scalars().all()
         assert count == []
+
+
+# ---------------------------------------------------------------------------
+# Safety nets: task submission failure rolls state back to a known good state
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("tenant_ctx")
+class TestSubmitTaskFailureSafetyNet:
+    """If submit_task raises after the index row is already committed the
+    service must leave the row in a recoverable (non-orphaned) state."""
+
+    async def test_create_index_marks_failed_on_submit_error(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When submit_task fails, create_index must:
+        - flip the index to FAILED (not leave it BUILDING)
+        - set error_message
+        - re-raise the original exception
+        """
+        ds = await _seed_dataset(session)
+
+        async def _boom(*_a: object, **_kw: object) -> None:
+            raise RuntimeError("injected failure")
+
+        monkeypatch.setattr(
+            "lcp.services.index_service.task_service.submit_task", _boom,
+        )
+
+        with pytest.raises(RuntimeError, match="injected failure"):
+            await index_service.create_index(
+                session,
+                dataset_uuid=ds.dataset_uuid,
+                index_name="fail_idx",
+                column_name="embedding",
+                index_type="IVF_PQ",
+            )
+
+        # The index row must exist but in FAILED state.
+        rows = (
+            await session.execute(
+                select(Index).where(
+                    Index.dataset_uuid == ds.dataset_uuid,
+                    Index.index_name == "fail_idx",
+                ),
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == "FAILED"
+        assert rows[0].error_message is not None
+        assert "injected failure" in rows[0].error_message
+
+    async def test_optimize_index_reverts_to_ready_on_submit_error(
+        self, session: AsyncSession, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When submit_task fails, optimize_index must:
+        - revert the index back to READY (not leave it OPTIMIZING)
+        - set error_message
+        - re-raise the original exception
+        """
+        ds = await _seed_dataset(session)
+        idx = Index(
+            dataset_uuid=ds.dataset_uuid,
+            index_name="opt_fail_idx",
+            column_name="embedding",
+            index_type="IVF_PQ",
+            status="READY",
+        )
+        session.add(idx)
+        await session.commit()
+        await session.refresh(idx)
+
+        async def _boom(*_a: object, **_kw: object) -> None:
+            raise RuntimeError("optimize submit boom")
+
+        monkeypatch.setattr(
+            "lcp.services.index_service.task_service.submit_task", _boom,
+        )
+
+        with pytest.raises(RuntimeError, match="optimize submit boom"):
+            await index_service.optimize_index(
+                session, ds.dataset_uuid, idx.index_name,
+            )
+
+        # Row must be reverted to READY, not stuck at OPTIMIZING.
+        rows = (
+            await session.execute(
+                select(Index).where(
+                    Index.dataset_uuid == ds.dataset_uuid,
+                    Index.index_name == "opt_fail_idx",
+                ),
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == "READY"
+        assert rows[0].error_message is not None
+        assert "optimize submit boom" in rows[0].error_message

@@ -20,6 +20,20 @@ from lcp.services import task_service
 router = APIRouter(prefix="/v1/tasks", tags=["tasks"])
 
 
+def _not_found(message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail={"code": "NOT_FOUND", "message": message},
+    )
+
+
+def _conflict(code: str, message: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": code, "message": message},
+    )
+
+
 @router.get("", response_model=TaskListResponse, summary="List tasks")
 async def list_tasks(
     session: Annotated[AsyncSession, SessionDep],
@@ -95,10 +109,7 @@ async def get_task(
     try:
         obj = await task_service.get_task(session, task_uuid)
     except task_service.TaskNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "NOT_FOUND", "message": f"task {task_uuid} not found"},
-        ) from exc
+        raise _not_found(f"task {task_uuid} not found") from exc
     return TaskResponse.model_validate(obj)
 
 
@@ -117,15 +128,9 @@ async def cancel_task(
     try:
         obj = await task_service.cancel_task(session, task_uuid)
     except task_service.TaskNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "NOT_FOUND", "message": f"task {task_uuid} not found"},
-        ) from exc
+        raise _not_found(f"task {task_uuid} not found") from exc
     except task_service.TaskTransitionError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "INVALID_TRANSITION", "message": str(exc)},
-        ) from exc
+        raise _conflict("INVALID_TRANSITION", str(exc)) from exc
     return TaskResponse.model_validate(obj)
 
 
@@ -145,13 +150,7 @@ async def retry_task(
     try:
         obj = await task_service.retry_task(session, task_uuid)
     except task_service.TaskNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "NOT_FOUND", "message": f"task {task_uuid} not found"},
-        ) from exc
+        raise _not_found(f"task {task_uuid} not found") from exc
     except task_service.TaskTransitionError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "INVALID_TRANSITION", "message": str(exc)},
-        ) from exc
+        raise _conflict("INVALID_TRANSITION", str(exc)) from exc
     return TaskResponse.model_validate(obj)

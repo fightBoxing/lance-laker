@@ -1,146 +1,63 @@
-"""Meta-sync service: reconcile MySQL ``dataset`` rows against Gravitino.
+"""Gravitino fileset → LCP dataset mapping and meta-sync service.
 
-Source-of-Truth contract (decided at design time, see
-``lcp.integrations.gravitino.mapping`` docstring):
+Responsibilities:
+- Discover Gravitino filesets that are not yet registered in LCP
+- Reconcile metadata (storage_location, comment) from Gravitino into LCP
+- Write back operational stats (row_count, index_coverage) to Gravitino properties
 
-    * Gravitino owns *catalog* facts (storage_location, comment, type).
-    * LCP  owns *operational* facts (row_count, status, index_coverage, ...)
-      and writes them back to ``fileset.properties`` under ``lcp.*``.
-
-Reconcile flow per dataset:
-
-    1. Resolve the LCP dataset row (RLS filtered by tenant).
-    2. Fetch the corresponding Gravitino fileset (``schema=db_schema``,
-       ``name=table_name``).
-    3. Project the fileset into a :class:`DatasetPatch` and apply non-empty
-       changes to the ORM row.
-    4. Push the LCP operational state into ``fileset.properties`` so the
-       Gravitino catalog UI surfaces it.
-    5. Stamp ``Dataset.extra['gravitino_synced_at']`` with the wall clock
-       so observability dashboards can detect drifting reconcilers.
-
-Tenancy:
-
-    The service expects a system principal (set via :func:`with_system_context`)
-    because cron jobs and the meta-sync REST endpoint do not carry per-user
-    JWTs.  The router layer is responsible for setting that context before
-    calling in.
-
-Why a service module (not a router that does it inline):
-
-    * Cron jobs and REST handlers both invoke this module.  Sharing the
-      logic keeps the SLO-relevant code in one place.
-    * Tests can drive the service with a ``MagicMock(spec=GravitinoClient)``
-      and an in-memory sqlite session — no live Gravitino, no MySQL.
+Source-of-truth contract:
+- Gravitino owns: storage_location, comment, fileset_type
+- LCP owns: row_count, fragment_count, index_coverage, status, latest_version
 """
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Protocol
+import uuid
+from dataclasses import dataclass
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Dataset
 from lcp.integrations.gravitino.client import (
     Fileset,
-    GravitinoError,
-    GravitinoNotFoundError,
+    GravitinoAPIError,
+    GravitinoClient,
+    GravitinoDisabledError,
+    get_gravitino_client,
 )
-from lcp.integrations.gravitino.mapping import (
-    DatasetPatch,
-    dataset_to_property_patch,
-    fileset_to_dataset_patch,
-)
+
+__all__ = [
+    "MetaSyncResult",
+    "reconcile_schema",
+    "reconcile_all",
+    "write_back_stats",
+]
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Result types
+# Data structures
 # ---------------------------------------------------------------------------
 
 
-# DDL contract: ``Dataset.extra`` is JSON; we tuck Gravitino sync metadata
-# under this key so it does not collide with future ``extra`` consumers.
-EXTRA_KEY = "gravitino"
-
-
-class _ClientProtocol(Protocol):
-    """Subset of :class:`GravitinoClient` we depend on.
-
-    Declared here (rather than importing the concrete class everywhere)
-    so unit tests can pass a plain ``MagicMock`` without inheriting from
-    the real client; satisfies the duck-typed interface.
-    """
-
-    async def get_fileset(self, schema: str, name: str) -> Fileset: ...
-
-    async def list_filesets(self, schema: str) -> list[str]: ...
-
-    async def set_fileset_properties(
-        self, schema: str, name: str, properties: dict[str, str],
-    ) -> Fileset: ...
-
-
 @dataclass
-class DatasetSyncOutcome:
-    """Per-dataset reconcile outcome.
+class MetaSyncResult:
+    """Outcome of a reconciliation pass."""
 
-    ``status`` is a small closed vocabulary so the REST layer can render
-    it without further translation:
+    schemas_scanned: int = 0
+    filesets_discovered: int = 0
+    datasets_created: int = 0
+    datasets_updated: int = 0
+    errors: list[str] | None = None
 
-        * ``synced``       - reconciled successfully (whether or not a
-                             change was needed); see ``changed`` flag.
-        * ``not_in_gravitino`` - LCP knows the dataset, Gravitino does
-                             not (404).  Operator action required.
-        * ``error``        - any other failure; ``error`` field carries
-                             the human-readable message.
-    """
-
-    dataset_uuid: str
-    status: str
-    changed: bool = False
-    pushed_properties: bool = False
-    error: str | None = None
-
-
-@dataclass
-class SyncReport:
-    """Aggregate report for a reconcile run.
-
-    ``items`` keeps per-dataset detail; the counters are derived but
-    cached on the dataclass so a JSON-serialised report (sent via the
-    REST layer) does not require the consumer to recompute them.
-    """
-
-    total: int = 0
-    synced: int = 0
-    changed: int = 0
-    pushed: int = 0
-    missing: int = 0
-    errors: int = 0
-    items: list[DatasetSyncOutcome] = field(default_factory=list)
-
-    def record(self, outcome: DatasetSyncOutcome) -> None:
-        """Append ``outcome`` and update aggregate counters."""
-
-        self.items.append(outcome)
-        self.total += 1
-        if outcome.status == "synced":
-            self.synced += 1
-            if outcome.changed:
-                self.changed += 1
-            if outcome.pushed_properties:
-                self.pushed += 1
-        elif outcome.status == "not_in_gravitino":
-            self.missing += 1
-        else:
-            self.errors += 1
+    def __post_init__(self) -> None:
+        if self.errors is None:
+            self.errors = []
 
 
 # ---------------------------------------------------------------------------
@@ -148,180 +65,162 @@ class SyncReport:
 # ---------------------------------------------------------------------------
 
 
-async def reconcile_dataset(
+async def reconcile_schema(
     session: AsyncSession,
-    client: _ClientProtocol,
-    dataset: Dataset,
+    schema: str,
     *,
-    push_properties: bool = True,
-    now: datetime | None = None,
-) -> DatasetSyncOutcome:
-    """Reconcile a single ORM ``dataset`` against Gravitino.
+    tenant_id: str,
+    client: GravitinoClient | None = None,
+    dry_run: bool = False,
+) -> MetaSyncResult:
+    """Reconcile all filesets in one Gravitino schema with LCP datasets.
 
-    The caller is expected to have already resolved the ORM row (so that
-    RLS + dataset_service.get_dataset semantics live in the router/cron
-    layer, not here).  Keeps this function easy to test in isolation.
+    For each fileset found:
+    - If no matching LCP dataset exists → create one (ACTIVE status).
+    - If a matching dataset exists → update storage_uri/description if
+      they diverged from Gravitino's source of truth.
 
-    ``push_properties=False`` lets a cron job pull-only on a tight loop
-    while a slower job handles the write-back, but the default does both
-    in one shot for simplicity.
+    Matching is on ``(catalog, db_schema, table_name)`` = ``(gravitino_catalog,
+    schema, fileset_name)``.
     """
 
-    schema = dataset.db_schema
-    table = dataset.table_name
-    log_ctx = {"dataset_uuid": dataset.dataset_uuid, "schema": schema, "table": table}
+    gc = client or get_gravitino_client()
+    result = MetaSyncResult()
 
     try:
-        fileset = await client.get_fileset(schema, table)
-    except GravitinoNotFoundError:
-        # Operator-visible signal: LCP claims a dataset that Gravitino
-        # has never seen.  Don't auto-create on the Gravitino side —
-        # creating catalog entries from inside LCP would be a footgun.
-        logger.warning("meta-sync: fileset not found in Gravitino", extra=log_ctx)
-        return DatasetSyncOutcome(
-            dataset_uuid=dataset.dataset_uuid,
-            status="not_in_gravitino",
-        )
-    except GravitinoError as exc:
-        logger.exception("meta-sync: Gravitino get_fileset failed", extra=log_ctx)
-        return DatasetSyncOutcome(
-            dataset_uuid=dataset.dataset_uuid,
-            status="error",
-            error=str(exc),
-        )
+        fileset_names = await gc.list_filesets(schema)
+    except (GravitinoDisabledError, GravitinoAPIError) as exc:
+        result.errors.append(f"list_filesets({schema}): {exc}")  # type: ignore[union-attr]
+        return result
 
-    # ----- Direction A: Gravitino -> LCP ----------------------------------
-    patch: DatasetPatch = fileset_to_dataset_patch(fileset)
-    changed = patch.apply(dataset)
+    result.filesets_discovered = len(fileset_names)
+    catalog = gc._catalog  # noqa: SLF001
 
-    # ----- Direction B: LCP -> Gravitino properties -----------------------
-    # Skip the round-trip when caller opts out (pull-only mode).  Keeps
-    # the REST trigger fast for read-only diff reports.
-    pushed = False
-    if push_properties:
+    for name in fileset_names:
         try:
-            properties = dataset_to_property_patch(dataset, now=now)
-            await client.set_fileset_properties(schema, table, properties)
-            pushed = True
-        except GravitinoError as exc:
-            logger.exception(
-                "meta-sync: set_fileset_properties failed", extra=log_ctx,
-            )
-            # We *did* update LCP from the fileset; flag the property
-            # push as failed but keep the LCP change.  Operators can
-            # retry; meanwhile LCP is at least consistent with Gravitino
-            # in the catalog direction.  Commit the LCP-side patch now
-            # before bailing out so a subsequent ``session.refresh(ds)``
-            # in the test (or a parallel reader in production) sees the
-            # new ``storage_uri``/``description`` we just applied.
+            fileset = await gc.get_fileset(schema, name)
+        except GravitinoAPIError as exc:
+            result.errors.append(f"get_fileset({schema}/{name}): {exc}")  # type: ignore[union-attr]
+            continue
+
+        # Check if dataset already exists in LCP.
+        stmt = select(Dataset).where(
+            Dataset.catalog == catalog,
+            Dataset.db_schema == schema,
+            Dataset.table_name == name,
+            Dataset.tenant_id == tenant_id,
+        )
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+
+        if existing is None:
+            # Create new dataset from Gravitino fileset.
+            if not dry_run:
+                obj = Dataset(
+                    dataset_uuid=str(uuid.uuid4()),
+                    catalog=catalog,
+                    db_schema=schema,
+                    table_name=name,
+                    storage_uri=fileset.storage_location,
+                    tenant_id=tenant_id,
+                    description=fileset.comment,
+                    status="ACTIVE",
+                )
+                session.add(obj)
+            result.datasets_created += 1
+        else:
+            # Update if Gravitino metadata diverged.
+            changed = False
+            if (
+                fileset.storage_location
+                and existing.storage_uri != fileset.storage_location
+            ):
+                if not dry_run:
+                    existing.storage_uri = fileset.storage_location
+                changed = True
+            if fileset.comment and existing.description != fileset.comment:
+                if not dry_run:
+                    existing.description = fileset.comment
+                changed = True
             if changed:
-                await session.commit()
-            return DatasetSyncOutcome(
-                dataset_uuid=dataset.dataset_uuid,
-                status="error",
-                changed=changed,
-                pushed_properties=False,
-                error=f"set_fileset_properties: {exc}",
-            )
+                result.datasets_updated += 1
 
-    # ----- Stamp last-sync metadata into Dataset.extra --------------------
-    # Mutating ``dataset.extra`` in-place is intentional: SQLAlchemy will
-    # detect the JSON column change because we reassign the dict (some
-    # mutation-tracking impls don't pick up nested edits otherwise).
-    extra: dict[str, Any] = dict(dataset.extra or {})
-    sync_meta: dict[str, Any] = dict(extra.get(EXTRA_KEY) or {})
-    sync_meta["last_synced_at"] = (now or datetime.now(tz=timezone.utc)).astimezone(
-        timezone.utc,
-    ).isoformat()
-    sync_meta["last_storage_location"] = fileset.storage_location
-    sync_meta["last_pushed_properties"] = pushed
-    extra[EXTRA_KEY] = sync_meta
-    dataset.extra = extra
+    if not dry_run:
+        await session.commit()
 
-    # Persist whatever we changed in this run (extra is always touched;
-    # the patch may have touched storage_uri/description too).
-    await session.commit()
-
-    return DatasetSyncOutcome(
-        dataset_uuid=dataset.dataset_uuid,
-        status="synced",
-        changed=changed,
-        pushed_properties=pushed,
-    )
+    return result
 
 
 async def reconcile_all(
     session: AsyncSession,
-    client: _ClientProtocol,
     *,
-    schema: str | None = None,
-    push_properties: bool = True,
-    now: datetime | None = None,
-) -> SyncReport:
-    """Reconcile every dataset (optionally filtered by schema).
+    tenant_id: str,
+    client: GravitinoClient | None = None,
+    dry_run: bool = False,
+) -> MetaSyncResult:
+    """Reconcile all schemas in the configured Gravitino catalog."""
 
-    The query is RLS-filtered by the current principal — production
-    callers (cron jobs) must enter a system context first if they want
-    to scan across tenants; the REST trigger uses the caller's tenant.
+    gc = client or get_gravitino_client()
+    total = MetaSyncResult()
 
-    We deliberately reconcile sequentially.  Concurrent fan-out would
-    speed things up, but Gravitino servers can be modest and mass
-    parallel reads from a cron job risks overwhelming them.  When this
-    becomes a real bottleneck, switch to a bounded asyncio.Semaphore.
-    """
+    try:
+        schemas = await gc.list_schemas()
+    except (GravitinoDisabledError, GravitinoAPIError) as exc:
+        total.errors.append(f"list_schemas: {exc}")  # type: ignore[union-attr]
+        return total
 
-    stmt = select(Dataset)
-    if schema is not None:
-        stmt = stmt.where(Dataset.db_schema == schema)
-    stmt = stmt.order_by(Dataset.id.asc())
+    total.schemas_scanned = len(schemas)
 
-    datasets: Sequence[Dataset] = (await session.execute(stmt)).scalars().all()
-
-    report = SyncReport()
-    for ds in datasets:
-        outcome = await reconcile_dataset(
+    for schema in schemas:
+        partial = await reconcile_schema(
             session,
-            client,
-            ds,
-            push_properties=push_properties,
-            now=now,
+            schema,
+            tenant_id=tenant_id,
+            client=gc,
+            dry_run=dry_run,
         )
-        report.record(outcome)
-    return report
+        total.filesets_discovered += partial.filesets_discovered
+        total.datasets_created += partial.datasets_created
+        total.datasets_updated += partial.datasets_updated
+        if partial.errors:
+            total.errors.extend(partial.errors)  # type: ignore[union-attr]
+
+    return total
 
 
-async def discover_unknown_filesets(
-    client: _ClientProtocol,
+async def write_back_stats(
     session: AsyncSession,
+    dataset_uuid: str,
     *,
-    schema: str,
-) -> list[str]:
-    """Return Gravitino fileset names not present in LCP (read-only diff).
+    client: GravitinoClient | None = None,
+) -> bool:
+    """Push LCP operational stats back to Gravitino fileset properties.
 
-    We *do not* auto-register them.  Auto-creation would require choosing
-    a tenant_id and owner from thin air, which is a policy decision that
-    belongs to a human operator.  Listing them is enough to drive a
-    one-click registration UI later.
+    Returns True if write-back succeeded, False otherwise (non-fatal).
     """
 
-    fileset_names = await client.list_filesets(schema)
-    if not fileset_names:
-        return []
+    gc = client or get_gravitino_client()
+    if not gc.enabled:
+        return False
 
-    stmt = (
-        select(Dataset.table_name)
-        .where(Dataset.db_schema == schema)
-        .where(Dataset.table_name.in_(fileset_names))
-    )
-    known = {row for row in (await session.execute(stmt)).scalars().all()}
-    return [name for name in fileset_names if name not in known]
+    stmt = select(Dataset).where(Dataset.dataset_uuid == dataset_uuid)
+    ds = (await session.execute(stmt)).scalar_one_or_none()
+    if ds is None:
+        return False
 
+    props = {
+        "lcp.row_count": str(ds.row_count),
+        "lcp.fragment_count": str(ds.fragment_count),
+        "lcp.index_coverage": str(ds.index_coverage),
+        "lcp.status": ds.status,
+        "lcp.latest_version": str(ds.latest_version),
+        "lcp.synced_at": utcnow_naive().isoformat(),
+    }
 
-__all__ = [
-    "DatasetSyncOutcome",
-    "EXTRA_KEY",
-    "SyncReport",
-    "discover_unknown_filesets",
-    "reconcile_all",
-    "reconcile_dataset",
-]
+    try:
+        await gc.set_properties(ds.db_schema, ds.table_name, props)
+        return True
+    except (GravitinoAPIError, GravitinoDisabledError) as exc:
+        logger.warning(
+            "write_back_stats failed for %s: %s", dataset_uuid, exc,
+        )
+        return False

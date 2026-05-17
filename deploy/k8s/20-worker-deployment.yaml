@@ -1,9 +1,15 @@
 ---
-# Lifecycle worker Deployment.
+# Lifecycle worker Deployment (includes embedded planner).
 #
-# Generic worker: claims any task type.  If you want specialised pools
-# (e.g. INDEX_OPTIMIZE only), copy this manifest and pass
-# ``--task-type INDEX_OPTIMIZE`` via args.
+# Generic worker: claims any task type and runs an embedded planner loop
+# (every 60s) that scans lifecycle policies and emits tasks.  The planner
+# replaces the former standalone CronJob — one fewer manifest to manage.
+#
+# To disable the planner and run as a pure executor:
+#   args: ["--disable-planner"]
+#
+# To specialise by task type (e.g. INDEX_OPTIMIZE only):
+#   args: ["--task-type", "INDEX_OPTIMIZE", "--disable-planner"]
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -14,7 +20,15 @@ metadata:
     app.kubernetes.io/component: worker
     app.kubernetes.io/part-of: lcp
 spec:
-  replicas: 1
+  # 2 replicas: if one worker pod is evicted or a node drains, the other
+  # continues claiming tasks.  Workers are stateless at the Pod level --
+  # task ownership is tracked in the DB with heartbeats.
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: lcp-worker
@@ -32,39 +46,33 @@ spec:
         prometheus.io/port: "9464"
         prometheus.io/path: "/metrics"
     spec:
-      # The worker exposes a 9464 metrics port (see ports: below) but
-      # no application HTTP surface; terminationGracePeriod gives
-      # SIGTERM enough time for the in-flight tick to drain to
-      # SUCCEEDED / FAILED before the kubelet sends SIGKILL.  See
-      # lifecycle_worker signal handler.
-      terminationGracePeriodSeconds: 30
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: lcp-worker
+                topologyKey: kubernetes.io/hostname
+      # Extended grace period: the worker's SIGTERM handler drains the
+      # in-flight task tick (executor calls lance / MySQL) before exiting.
+      # 120 s gives the executor a full cycle to reach SUCCEEDED or FAILED.
+      terminationGracePeriodSeconds: 120
       containers:
         - name: worker
           image: lcp:dev
           imagePullPolicy: IfNotPresent
-          # Override the image's default REST CMD with the worker
-          # entry-point.  Args are passed through to argparse.
           command: ["python", "-m", "lcp.workers.lifecycle_worker"]
           args:
             - "--idle-seconds=2"
             - "--busy-seconds=0.1"
+            - "--planner-seconds=60"
           envFrom:
             - configMapRef:
                 name: lcp-config
             - secretRef:
                 name: lcp-secrets
-          ports:
-            # Prometheus scrape port; the CLI starts a stand-alone
-            # exporter via prometheus_client.start_http_server.
-            - name: metrics
-              containerPort: 9464
-              protocol: TCP
-          # No application probes: the worker is a polling daemon
-          # with no application HTTP surface.  Liveness is observable
-          # via the worker_registry table + kubectl logs.  We do not
-          # probe the metrics port either -- prometheus_client's
-          # background HTTP server is best-effort and we never want a
-          # metrics-only failure to crash-loop the worker.
           resources:
             requests:
               cpu: 50m

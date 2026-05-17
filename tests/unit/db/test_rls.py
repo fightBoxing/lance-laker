@@ -97,6 +97,16 @@ class TestFindRlsTargets:
         targets = _find_rls_targets(stmt)
         assert [t.name for t in targets] == ["task"]
 
+    def test_p5_fast_path_select_without_from(self) -> None:
+        """P-5: SELECT without FROM must return [] without calling get_final_froms."""
+
+        from sqlalchemy import literal
+        # ``select(literal(1))`` compiles to ``SELECT 1`` — no FROM clause.
+        stmt = select(literal(1))
+        # Must return empty list without error, even with no principal bound.
+        targets = _find_rls_targets(stmt)
+        assert targets == []
+
 
 # ---------------------------------------------------------------------------
 # _inject_tenant_filter: the C-1 fix
@@ -175,14 +185,14 @@ class TestBeforeExecuteHook:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("LCP_ENFORCE_TENANT_RLS", "false")
-        from lcp.core.config import get_settings
-        get_settings.cache_clear()
+        from lcp.core.config import reset_settings
+        reset_settings()
         try:
             stmt = select(tables["dataset"])
             out_stmt, _, _ = _before_execute(None, stmt, None, None, {})
             assert out_stmt is stmt
         finally:
-            get_settings.cache_clear()
+            reset_settings()
 
     def test_injects_when_principal_bound(self, tables: dict[str, Table]) -> None:
         token = set_current_tenant(

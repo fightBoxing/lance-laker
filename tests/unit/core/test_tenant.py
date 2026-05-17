@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 import pytest
 
@@ -17,7 +18,11 @@ from lcp.core.tenant import (
 pytestmark = pytest.mark.unit
 
 
-def _make_principal(tenant: str = "acme", sub: str = "u-1", method: str = "oidc") -> TenantPrincipal:
+def _make_principal(
+    tenant: str = "acme",
+    sub: str = "u-1",
+    method: Literal["oidc", "mtls", "system"] = "oidc",
+) -> TenantPrincipal:
     return TenantPrincipal(tenant_id=tenant, subject=sub, auth_method=method)
 
 

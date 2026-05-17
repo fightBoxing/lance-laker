@@ -12,6 +12,12 @@ Process model
 -------------
 - One async event loop, one DB engine, one ``register_worker`` call at
   startup.
+- A parallel heartbeat task refreshes ``last_heartbeat_at`` every
+  ``--heartbeat-seconds`` (default 10s) so the reaper does not mistake
+  a healthy worker for a dead one.
+- A parallel planner task runs ``plan_once()`` every
+  ``--planner-seconds`` (default 60s), replacing the standalone
+  ``lcp-planner`` CronJob.  Disable with ``--disable-planner``.
 - Loop body: ``run_iteration``; sleep ``--idle-seconds`` between empty
   ticks (no task claimed) and ``--busy-seconds`` between successful
   ticks so the worker yields the DB connection promptly.
@@ -21,10 +27,6 @@ Process model
 
 What is intentionally out of scope
 ----------------------------------
-- Heartbeat refresh.  ``register_worker`` stamps the lease at startup
-  but the worker does not yet refresh ``last_heartbeat_at`` periodically;
-  the scheduler's reaper does not run yet either, so this is symmetric.
-  Hooking heartbeat into a parallel ``asyncio.Task`` is a follow-up.
 - Metrics.  No prometheus / log fan-out beyond stdlib ``logging``.
 - Multi-worker capacity per process.  ``capacity=1`` is hard-coded; lift
   via ``register_worker(capacity=...)`` once executors stop being stubs.
@@ -56,6 +58,7 @@ from lcp.observability import (
     time_block,
 )
 from lcp.services import scheduler_service
+from lcp.services.lifecycle_planner_service import plan_once
 from lcp.workers.lifecycle_executors import build_default_registry
 from lcp.workers.lifecycle_worker_service import (
     TickOutcome,
@@ -100,6 +103,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Sleep this long after a successful claim before next pull.",
     )
     parser.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=10.0,
+        help="Interval between heartbeat refreshes (default 10s).",
+    )
+    parser.add_argument(
         "--max-iterations",
         type=int,
         default=0,
@@ -116,6 +125,20 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(default: '<hostname>-<8 hex>')."
         ),
     )
+    parser.add_argument(
+        "--planner-seconds",
+        type=float,
+        default=60.0,
+        help=(
+            "Interval between planner ticks that scan lifecycle policies "
+            "and emit tasks (default 60s).  Set 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--disable-planner",
+        action="store_true",
+        help="Disable the embedded planner loop (run as pure executor only).",
+    )
     return parser.parse_args(argv)
 
 
@@ -128,6 +151,79 @@ def _default_worker_id() -> str:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+
+
+async def _heartbeat_loop(
+    factory: async_sessionmaker,
+    worker_id: str,
+    lease_id: str,
+    interval: float,
+    shutdown: asyncio.Event,
+) -> None:
+    """Background task that refreshes the worker's heartbeat periodically.
+
+    Runs until *shutdown* is set.  Errors are logged and swallowed — a
+    single heartbeat failure must not crash the worker; the reaper's
+    timeout provides a grace window of ~3× the heartbeat interval.
+    """
+
+    while not shutdown.is_set():
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=interval)
+            break  # shutdown fired
+        except asyncio.TimeoutError:
+            pass  # interval elapsed — time to heartbeat
+
+        try:
+            async with factory() as session:
+                await scheduler_service.heartbeat(
+                    session,
+                    worker_id=worker_id,
+                    lease_id=lease_id,
+                )
+            _LOGGER.debug("heartbeat sent for %s", worker_id)
+        except Exception:  # noqa: BLE001 — heartbeat failures are non-fatal
+            _LOGGER.warning(
+                "heartbeat failed for %s; will retry next interval",
+                worker_id,
+                exc_info=True,
+            )
+
+
+async def _planner_loop(
+    factory: async_sessionmaker,
+    interval: float,
+    shutdown: asyncio.Event,
+) -> None:
+    """Background task that scans lifecycle policies and emits tasks.
+
+    Replaces the standalone ``lcp-planner`` CronJob.  Runs every *interval*
+    seconds (default 60s) inside the worker's event loop.  Errors are
+    logged and swallowed — a single planner tick failure must not crash the
+    worker; the next tick will retry cleanly thanks to idempotency keys.
+    """
+
+    while not shutdown.is_set():
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=interval)
+            break  # shutdown fired
+        except asyncio.TimeoutError:
+            pass  # interval elapsed — time to plan
+
+        try:
+            async with factory() as session:
+                tick = await plan_once(session)
+            _LOGGER.info(
+                "planner: scanned=%d emitted=%d skipped=%d",
+                tick.scanned_policies,
+                len(tick.emitted_tasks),
+                tick.skipped_duplicates,
+            )
+        except Exception:  # noqa: BLE001 — planner failures are non-fatal
+            _LOGGER.warning(
+                "planner tick failed; will retry next interval",
+                exc_info=True,
+            )
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -176,37 +272,75 @@ async def _run(args: argparse.Namespace) -> int:
             )
             registry = build_default_registry()
 
-            # 2. Drain loop.
-            while not shutdown.is_set():
-                async with factory() as session:
-                    with time_block() as elapsed:
+            # 2. Start background heartbeat so the reaper never
+            #    mistakes a healthy worker for a dead one.
+            heartbeat_task = asyncio.create_task(
+                _heartbeat_loop(
+                    factory,
+                    worker_id=worker.worker_id,
+                    lease_id=worker.lease_id,
+                    interval=args.heartbeat_seconds,
+                    shutdown=shutdown,
+                ),
+            )
+
+            # 3. Start embedded planner (replaces the standalone CronJob).
+            planner_task: asyncio.Task[None] | None = None
+            if not args.disable_planner and args.planner_seconds > 0:
+                planner_task = asyncio.create_task(
+                    _planner_loop(
+                        factory,
+                        interval=args.planner_seconds,
+                        shutdown=shutdown,
+                    ),
+                )
+                _LOGGER.info(
+                    "planner loop started (interval=%.0fs)",
+                    args.planner_seconds,
+                )
+            else:
+                _LOGGER.info("planner loop disabled")
+
+            # 4. Drain loop.
+            try:
+                while not shutdown.is_set():
+                    async with factory() as session:
                         outcome = await run_iteration(
                             session,
                             config=config,
                             registry=registry,
                         )
-                _record_outcome_metrics(outcome, elapsed[0])
-                _log_outcome(outcome)
+                    _log_outcome(outcome)
 
-                iteration += 1
-                if args.max_iterations and iteration >= args.max_iterations:
-                    _LOGGER.info(
-                        "max-iterations=%d reached; exiting",
-                        args.max_iterations,
-                    )
-                    break
+                    iteration += 1
+                    if args.max_iterations and iteration >= args.max_iterations:
+                        _LOGGER.info(
+                            "max-iterations=%d reached; exiting",
+                            args.max_iterations,
+                        )
+                        break
 
-                # Sleep, but break early when shutdown fires.
-                sleep_seconds = (
-                    args.busy_seconds if outcome.claimed
-                    else args.idle_seconds
-                )
-                try:
-                    await asyncio.wait_for(
-                        shutdown.wait(), timeout=sleep_seconds,
+                    # Sleep, but break early when shutdown fires.
+                    sleep_seconds = (
+                        args.busy_seconds if outcome.claimed
+                        else args.idle_seconds
                     )
-                except asyncio.TimeoutError:
-                    pass
+                    try:
+                        await asyncio.wait_for(
+                            shutdown.wait(), timeout=sleep_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                # Cancel background tasks so they don't outlive the loop.
+                shutdown.set()
+                for bg_task in (heartbeat_task, planner_task):
+                    if bg_task is not None:
+                        bg_task.cancel()
+                        try:
+                            await bg_task
+                        except asyncio.CancelledError:
+                            pass
     finally:
         await engine.dispose()
     _LOGGER.info("worker exited cleanly after %d iterations", iteration)

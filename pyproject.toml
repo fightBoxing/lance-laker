@@ -30,7 +30,7 @@ dependencies = [
     "pymysql>=1.1.0",
 
     # Security
-    "python-jose[cryptography]>=3.3.0",
+    "pyjwt[crypto]>=2.8.0",
     "httpx>=0.27.0",
 
     # Misc
@@ -87,6 +87,7 @@ embedding = [
 ]
 
 [project.scripts]
+lcp-server = "lcp.api.unified_server:run"
 lcp-rest = "lcp.api.rest.main:run"
 lcp-grpc = "lcp.api.grpc.server:run"
 
@@ -121,7 +122,6 @@ markers = [
 ]
 filterwarnings = [
     "error",
-    "ignore::DeprecationWarning:jose.*",
     "ignore::DeprecationWarning:passlib.*",
     "ignore::DeprecationWarning:google.*",
     "ignore::PendingDeprecationWarning",

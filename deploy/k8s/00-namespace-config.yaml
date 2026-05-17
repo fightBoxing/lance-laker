@@ -87,12 +87,36 @@ type: Opaque
 stringData:
   AWS_ACCESS_KEY_ID: "minioadmin"
   AWS_SECRET_ACCESS_KEY: "minioadmin"
-  # Same MinIO credentials, surfaced under the
-  # ``LCP_LANCE_STORAGE_*`` names that
-  # ``Settings.lance_storage_access_key`` / ``lance_storage_secret_key``
-  # actually read.  Adding them here lets pods pick the keys up via
-  # plain ``envFrom: secretRef`` -- no per-Deployment ``valueFrom``
-  # mapping needed, mirroring how the ConfigMap handles the
-  # non-secret half of the pair.
-  LCP_LANCE_STORAGE_ACCESS_KEY: "minioadmin"
-  LCP_LANCE_STORAGE_SECRET_KEY: "minioadmin"
+---
+# PodDisruptionBudgets ensure at least one replica stays healthy during
+# voluntary disruptions (node drain, cluster upgrade, rolling restart).
+# minAvailable:1 works for both replicas=2 (allows 1 down) and any
+# larger count.  Use maxUnavailable instead if you want a percentage-
+# based policy once HPA is wired up.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lcp-server-pdb
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-server
+    app.kubernetes.io/part-of: lcp
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lcp-server
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: lcp-worker-pdb
+  namespace: lcp
+  labels:
+    app.kubernetes.io/name: lcp-worker
+    app.kubernetes.io/part-of: lcp
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lcp-worker

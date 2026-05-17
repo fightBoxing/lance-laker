@@ -27,6 +27,7 @@ from lcp.api.grpc.services import (
 from lcp.core.config import get_settings
 from lcp.core.security import (
     AuthenticationError,
+    extract_tenant_from_spiffe_id,
     extract_tenant_from_x509_subject,
 )
 from lcp.core.tenant import (
@@ -120,11 +121,25 @@ def _wrap_handler(handler: grpc.RpcMethodHandler) -> grpc.RpcMethodHandler:
 
 
 def _resolve_principal(context: grpc.aio.ServicerContext) -> TenantPrincipal:
-    """Build a :class:`TenantPrincipal` from the gRPC peer auth context."""
+    """Build a :class:`TenantPrincipal` from the gRPC peer auth context.
+
+    Resolution order (H-3 — SPIFFE-aware):
+
+    1. URI SAN — if the certificate carries a ``spiffe://…`` URI SAN that
+       encodes a ``/tenant/<id>`` path segment, that tenant id wins.
+    2. ``O=`` distinguished-name attribute (``x509_organization``).
+    3. ``CN=tenant-<id>.<worker>`` prefix fallback.
+
+    This order mirrors the SPIFFE Workload API recommendation: URI SANs are
+    the authoritative identity source; DN attributes are a legacy fallback.
+    """
 
     auth_context = context.auth_context()
     common_name_values = auth_context.get("x509_common_name") or []
     organization_values = auth_context.get("x509_organization") or []
+    # gRPC exposes URI SANs under the "x509_uri" key as a list of
+    # bytes/str entries.  We try each value until we find a SPIFFE URI.
+    uri_san_values = auth_context.get("x509_uri") or []
 
     if not common_name_values:
         raise AuthenticationError(
@@ -134,6 +149,33 @@ def _resolve_principal(context: grpc.aio.ServicerContext) -> TenantPrincipal:
     cn = _decode_first(common_name_values)
     organization = _decode_first(organization_values) if organization_values else None
 
+    # --- SPIFFE URI SAN (highest priority) ---
+    for raw_uri in uri_san_values:
+        # H-3: gRPC may deliver URI SAN values as raw bytes (DER-encoded
+        # extension content) or as pre-decoded strings depending on the
+        # grpcio version and the TLS backend.  A ``UnicodeDecodeError``
+        # here would produce a garbage ``uri`` string (mojibake) that
+        # silently falls through and picks the wrong tenant.  We skip
+        # any entry that cannot be decoded as UTF-8; a valid SPIFFE URI
+        # is always printable ASCII, so a decode failure means the value
+        # is either DER-encoded binary or malformed — neither is a SPIFFE
+        # URI we can trust.
+        if isinstance(raw_uri, bytes):
+            try:
+                uri = raw_uri.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        else:
+            uri = str(raw_uri)
+        tenant_id = extract_tenant_from_spiffe_id(uri)
+        if tenant_id is not None:
+            return TenantPrincipal(
+                tenant_id=tenant_id,
+                subject=cn,
+                auth_method="mtls",
+            )
+
+    # --- O= / CN= fallback ---
     tenant_id = extract_tenant_from_x509_subject(cn, organization)
     return TenantPrincipal(
         tenant_id=tenant_id,
@@ -143,11 +185,23 @@ def _resolve_principal(context: grpc.aio.ServicerContext) -> TenantPrincipal:
 
 
 def _decode_first(values: list[Any]) -> str:
-    """Decode the first element of a gRPC auth-context value list."""
+    """Decode the first element of a gRPC auth-context value list.
+
+    gRPC may return DN attribute values (CN, O=) as ``bytes`` or as
+    ``str`` depending on the version and TLS backend.  We always decode
+    as UTF-8; a ``UnicodeDecodeError`` means the value is binary/DER
+    garbage, which we surface as an ``AuthenticationError`` rather than
+    letting the caller receive a garbled identity string.
+    """
 
     head = values[0]
     if isinstance(head, bytes):
-        return head.decode("utf-8")
+        try:
+            return head.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise AuthenticationError(
+                f"Peer certificate attribute contains non-UTF-8 bytes: {exc}",
+            ) from exc
     return str(head)
 
 

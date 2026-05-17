@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 TaskType = Literal[
     "VECTORIZE",
     "COMPACTION",
+    "TTL_DELETE",
     "INDEX_BUILD",
     "INDEX_OPTIMIZE",
     "INDEX_CLEANUP",

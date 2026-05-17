@@ -1,125 +1,69 @@
-"""Async HTTP client for the Gravitino REST API (fileset catalog mode).
+"""Async HTTP client for the Gravitino REST API.
 
-Scope (intentionally narrow — see Karpathy rule 2):
+Supports:
+- Health check (``/api/version``)
+- List filesets in a schema (``GET /metalakes/{ml}/catalogs/{cat}/schemas/{schema}/filesets``)
+- Get fileset detail (``GET .../filesets/{name}``)
+- Set fileset properties (``PUT .../filesets/{name}`` with ``setProperties``)
 
-- List filesets in ``{metalake}/{catalog}/{schema}``.
-- Get a single fileset by name.
-- Update fileset properties (used by LCP to write index/lifecycle state
-  back to Gravitino so it surfaces in the upstream catalog UI).
-
-Out of scope on purpose:
-
-- Creating metalake / catalog / schema.  Those are platform-team concerns
-  and creating them implicitly from inside LCP would be a footgun.
-- Tables/views.  We map LCP datasets to **filesets**; the Lance file
-  layout is naturally a fileset (a directory of immutable files), and
-  Gravitino does not yet ship a first-class Lance table provider.
-- Authentication modes other than ``none`` and ``bearer`` (basic / OAuth2
-  client-credentials).  Defer until a deployment actually needs them; the
-  factory raises ``NotImplementedError`` instead of silently dropping
-  auth.
-
-Endpoint reference (Gravitino 0.6+):
-
-- GET    ``/api/metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/filesets``
-- GET    ``/api/metalakes/{metalake}/catalogs/{catalog}/schemas/{schema}/filesets/{name}``
-- PUT    same path (request body: ``{"updates": [...]}``).
-
-The minimal payload fields we depend on are documented in
-:class:`Fileset`; we deliberately ignore unknown fields so an upstream
-schema bump does not break us.
+All methods are async (httpx) and respect the configured timeout.  When
+``gravitino_url`` is empty the client raises :class:`GravitinoDisabledError`
+on any call so callers can surface a clear 503 / skip.
 """
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+import logging
 from dataclasses import dataclass, field
-from types import TracebackType
 from typing import Any
 
 import httpx
 
 from lcp.core.config import Settings, get_settings
-from lcp.observability import GRAVITINO_REQUEST_DURATION, time_block
 
-# ---------------------------------------------------------------------------
-# Public exception hierarchy
-# ---------------------------------------------------------------------------
+__all__ = [
+    "GravitinoClient",
+    "GravitinoDisabledError",
+    "GravitinoAPIError",
+    "Fileset",
+]
 
-
-class GravitinoError(Exception):
-    """Base class for all Gravitino client failures.
-
-    Carries the HTTP status (when available) so callers can decide whether
-    to retry vs surface the error.  ``status`` is ``None`` for transport-
-    level failures (DNS, connection refused, timeout).
-    """
-
-    def __init__(self, message: str, *, status: int | None = None) -> None:
-        super().__init__(message)
-        self.status = status
-
-
-class GravitinoNotFoundError(GravitinoError):
-    """404 on a Gravitino resource (metalake/catalog/schema/fileset)."""
-
-
-class GravitinoAuthError(GravitinoError):
-    """401/403 — credentials missing, expired, or not authorised."""
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Domain object — a thin slice of the Gravitino fileset payload
+# Exceptions
+# ---------------------------------------------------------------------------
+
+
+class GravitinoDisabledError(RuntimeError):
+    """Raised when a Gravitino call is attempted but integration is disabled."""
+
+
+class GravitinoAPIError(Exception):
+    """Raised when the Gravitino server returns a non-2xx response."""
+
+    def __init__(self, status_code: int, detail: str) -> None:
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Gravitino API {status_code}: {detail}")
+
+
+# ---------------------------------------------------------------------------
+# Data structures
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Fileset:
-    """A single Gravitino fileset, normalised to the fields LCP cares about.
-
-    We intentionally keep this dataclass minimal.  The raw upstream JSON is
-    available in :attr:`raw` for callers that need fields we have not yet
-    surfaced — that escape hatch lets us avoid a sweeping mapping refactor
-    every time Gravitino evolves.
-    """
+    """Minimal representation of a Gravitino fileset (table-equivalent)."""
 
     name: str
-    """Fileset name, e.g. ``customer_embeddings``.  Maps to LCP ``table_name``."""
-
+    schema_name: str
     storage_location: str
-    """Object-storage URI, e.g. ``s3://bucket/path``.  Maps to LCP ``storage_uri``."""
-
-    fileset_type: str
-    """``MANAGED`` or ``EXTERNAL``.  LCP-managed datasets should be MANAGED."""
-
-    comment: str | None
-    """Free-form description; maps to LCP ``description``."""
-
+    comment: str | None = None
+    fileset_type: str = "MANAGED"
     properties: dict[str, str] = field(default_factory=dict)
-    """User-defined key/value bag.  LCP writes ``lcp.*`` keys here for state."""
-
-    raw: dict[str, Any] = field(default_factory=dict)
-    """Original Gravitino JSON, for fields we have not normalised yet."""
-
-    @classmethod
-    def from_payload(cls, payload: dict[str, Any]) -> Fileset:
-        """Parse a Gravitino fileset JSON object into a :class:`Fileset`.
-
-        Tolerates missing optional fields; raises ``KeyError`` only on the
-        truly required ``name``/``storageLocation``/``type`` triplet because
-        those are always present in valid Gravitino responses.
-        """
-
-        return cls(
-            name=str(payload["name"]),
-            storage_location=str(payload["storageLocation"]),
-            fileset_type=str(payload["type"]),
-            comment=payload.get("comment"),
-            # Gravitino guarantees ``properties`` is a flat string-string map.
-            properties=dict(payload.get("properties") or {}),
-            raw=dict(payload),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -128,301 +72,154 @@ class Fileset:
 
 
 class GravitinoClient:
-    """Thin async wrapper around the Gravitino REST API.
+    """Async client for the Gravitino REST catalog API.
 
-    Designed as an async context manager so callers do not leak the
-    underlying ``httpx.AsyncClient``::
-
-        async with GravitinoClient.from_settings() as client:
-            fs = await client.get_fileset("public", "embeddings")
-
-    The class is also unit-testable without a real Gravitino: pass a
-    ``transport=httpx.MockTransport(...)`` in the constructor to intercept
-    outbound HTTP.
+    Create via :func:`get_gravitino_client` for production use.  Tests can
+    instantiate directly with a custom ``Settings`` instance.
     """
 
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        metalake: str,
-        catalog: str,
-        auth_type: str = "none",
-        token: str = "",
-        timeout_seconds: float = 5.0,
-        transport: httpx.AsyncBaseTransport | None = None,
-    ) -> None:
-        if not base_url:
-            raise GravitinoError("Gravitino base_url is empty; refusing to start")
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
+        self._base_url = self._settings.gravitino_url.rstrip("/")
+        self._metalake = self._settings.gravitino_metalake
+        self._catalog = self._settings.gravitino_catalog
+        self._timeout = self._settings.gravitino_timeout_seconds
+        self._token = self._settings.gravitino_auth_token
 
-        if auth_type not in ("none", "bearer"):
-            # Fail loud — silently dropping auth in prod would be a P0.
-            raise NotImplementedError(
-                f"Gravitino auth_type={auth_type!r} not supported; "
-                "use 'none' or 'bearer'.",
+    @property
+    def enabled(self) -> bool:
+        """Return True if Gravitino integration is configured."""
+        return bool(self._base_url)
+
+    def _require_enabled(self) -> None:
+        if not self.enabled:
+            raise GravitinoDisabledError(
+                "Gravitino integration is disabled (LCP_GRAVITINO_URL is empty).",
             )
 
-        if auth_type == "bearer" and not token:
-            raise GravitinoError("auth_type=bearer requires a non-empty token")
+    def _headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {"Accept": "application/json"}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        return headers
 
-        self._metalake = metalake
-        self._catalog = catalog
-
-        # Why "*/*" and not "application/json":
-        # Some Gravitino REST endpoints (observed on /catalogs/{c} and
-        # /filesets/{f} in v0.6.x) return 406 Not Acceptable when the
-        # client sends "Accept: application/json", but happily serve the
-        # exact same JSON body when Accept is "*/*" or absent.  This is
-        # a Jersey/Glassfish content-negotiation quirk on the server's
-        # @Produces declarations, not something we can negotiate around
-        # by tweaking the suffix (we tried application/json;charset=utf-8
-        # and application/vnd.gravitino+json -- still 406).  Sending */*
-        # matches what curl does by default and is the documented escape
-        # hatch when a server's content negotiation is broken.
-        headers: dict[str, str] = {"Accept": "*/*"}
-        if auth_type == "bearer":
-            headers["Authorization"] = f"Bearer {token}"
-
-        # ``base_url`` is normalised: trim trailing slash so f-string joins
-        # do not produce ``//api/...`` paths.
-        self._http = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            headers=headers,
-            timeout=timeout_seconds,
-            transport=transport,
+    def _schema_base(self, schema: str) -> str:
+        return (
+            f"{self._base_url}/api/metalakes/{self._metalake}"
+            f"/catalogs/{self._catalog}/schemas/{schema}/filesets"
         )
 
-    # ------- lifecycle ----------------------------------------------------
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    @classmethod
-    def from_settings(cls, settings: Settings | None = None) -> GravitinoClient:
-        """Build a client straight from the ``LCP_*`` env-driven settings."""
-
-        cfg = settings or get_settings()
-        return cls(
-            base_url=cfg.gravitino_url,
-            metalake=cfg.gravitino_metalake,
-            catalog=cfg.gravitino_catalog,
-            auth_type=cfg.gravitino_auth_type,
-            token=cfg.gravitino_token,
-            timeout_seconds=cfg.gravitino_request_timeout_seconds,
-        )
-
-    async def __aenter__(self) -> GravitinoClient:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.aclose()
-
-    async def aclose(self) -> None:
-        """Close the underlying HTTP connection pool."""
-
-        await self._http.aclose()
-
-    # ------- properties (handy for service callers) ----------------------
-
-    @property
-    def metalake(self) -> str:
-        return self._metalake
-
-    @property
-    def catalog(self) -> str:
-        return self._catalog
-
-    # ------- public API ---------------------------------------------------
-
-    async def ping(self) -> str:
-        """Cheapest call that proves URL + metalake + catalog + auth all line up.
-
-        Hits ``GET /api/metalakes/{metalake}/catalogs/{catalog}`` and returns
-        the catalog name from the response.  Used by:
-
-        - ``scripts/probe_gravitino.py`` when no schema is supplied (pure
-          connectivity check, useful when the catalog has zero schemas yet).
-        - the meta-sync CronJob's startup readiness probe (planned).
-
-        Raises :class:`GravitinoNotFoundError` if the metalake or catalog is
-        missing — which is exactly what an operator wants to see early
-        instead of hitting a 404 later from inside ``list_filesets``.
-        """
-
-        async with self._observe("ping"):
-            path = f"/api/metalakes/{self._metalake}/catalogs/{self._catalog}"
-            payload = await self._get_json(path)
-            # Gravitino returns ``{"code": 0, "catalog": {...}}``; tolerate flat shape too.
-            body = payload.get("catalog") if "catalog" in payload else payload
-            name = body.get("name") if isinstance(body, dict) else None
-            return str(name) if name else self._catalog
+    async def ping(self) -> dict[str, Any]:
+        """Check Gravitino server health via ``/api/version``."""
+        self._require_enabled()
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(
+                f"{self._base_url}/api/version",
+                headers=self._headers(),
+            )
+            _check_response(resp)
+            return resp.json()
 
     async def list_filesets(self, schema: str) -> list[str]:
-        """Return fileset *names* under ``{metalake}/{catalog}/{schema}``.
-
-        Gravitino's list endpoint returns a lightweight name index; pull the
-        full payload via :meth:`get_fileset` only when you actually need the
-        properties.  This split mirrors how the upstream Java SDK is used.
-        """
-
-        async with self._observe("list_filesets"):
-            path = self._fileset_collection_path(schema)
-            payload = await self._get_json(path)
-            # Response shape: ``{"identifiers": [{"namespace": [...], "name": "x"}, ...]}``.
-            identifiers = payload.get("identifiers") or []
-            return [str(item["name"]) for item in identifiers if "name" in item]
+        """Return fileset names under *schema*."""
+        self._require_enabled()
+        url = self._schema_base(schema)
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(url, headers=self._headers())
+            _check_response(resp)
+            data = resp.json()
+            # Gravitino returns {"identifiers": [{"name": "..."}]}
+            identifiers = data.get("identifiers") or []
+            return [ident["name"] for ident in identifiers if "name" in ident]
 
     async def get_fileset(self, schema: str, name: str) -> Fileset:
-        """Fetch a single fileset; raises :class:`GravitinoNotFoundError` on 404."""
+        """Fetch full fileset metadata."""
+        self._require_enabled()
+        url = f"{self._schema_base(schema)}/{name}"
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(url, headers=self._headers())
+            _check_response(resp)
+            data = resp.json().get("fileset", resp.json())
+            return Fileset(
+                name=data.get("name", name),
+                schema_name=schema,
+                storage_location=data.get("storageLocation", ""),
+                comment=data.get("comment"),
+                fileset_type=data.get("type", "MANAGED"),
+                properties=data.get("properties", {}),
+            )
 
-        async with self._observe("get_fileset"):
-            path = f"{self._fileset_collection_path(schema)}/{name}"
-            payload = await self._get_json(path)
-            # Gravitino wraps the actual entity under ``"fileset"``.  Tolerate
-            # either shape so a future flat response does not break us.
-            body = payload.get("fileset") if "fileset" in payload else payload
-            return Fileset.from_payload(body)
-
-    async def set_fileset_properties(
+    async def set_properties(
         self,
         schema: str,
         name: str,
         properties: dict[str, str],
-    ) -> Fileset:
-        """Patch ``properties`` on an existing fileset.
+    ) -> None:
+        """Update fileset properties (write-back from LCP → Gravitino)."""
+        self._require_enabled()
+        url = f"{self._schema_base(schema)}/{name}"
+        body = {
+            "updates": [
+                {"@type": "setProperty", "property": k, "value": v}
+                for k, v in properties.items()
+            ],
+        }
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.put(
+                url,
+                json=body,
+                headers=self._headers(),
+            )
+            _check_response(resp)
 
-        Implementation note: Gravitino's ``alterFileset`` PUT expects an
-        ``updates`` list where each entry has ``@type`` discriminator.  We
-        emit one ``setProperty`` entry per key — simpler than a single
-        ``replaceProperties`` because it keeps user-set properties we do
-        not know about untouched.
-        """
-
-        if not properties:
-            raise GravitinoError("set_fileset_properties called with empty dict")
-
-        async with self._observe("set_fileset_properties"):
-            path = f"{self._fileset_collection_path(schema)}/{name}"
-            body = {
-                "updates": [
-                    {"@type": "setProperty", "property": key, "value": value}
-                    for key, value in properties.items()
-                ],
-            }
-            payload = await self._put_json(path, body)
-            entity = payload.get("fileset") if "fileset" in payload else payload
-            return Fileset.from_payload(entity)
-
-    # ------- internals ---------------------------------------------------
-
-    @asynccontextmanager
-    async def _observe(self, op: str) -> AsyncIterator[None]:
-        """Time one HTTP round-trip and label it by ``op`` + result class.
-
-        ``result`` buckets:
-            ``success``    -- 2xx body parsed without error.
-            ``not_found``  -- 404 (informational, not a failure for callers
-                              that probe-then-create).
-            ``auth``       -- 401 / 403, distinct from generic error so
-                              dashboards can spot stale tokens.
-            ``error``      -- 5xx, transport error, or invalid JSON.
-
-        Why a context manager rather than a decorator: keeps the call
-        sites visually obvious (``async with`` block scopes the work)
-        and lets us observe both the duration and the result class
-        without adding a kwarg / try-except to every public method.
-        """
-
-        with time_block() as elapsed:
-            try:
-                yield
-            except GravitinoNotFoundError:
-                GRAVITINO_REQUEST_DURATION().labels(
-                    op=op, result="not_found",
-                ).observe(elapsed[0])
-                raise
-            except GravitinoAuthError:
-                GRAVITINO_REQUEST_DURATION().labels(
-                    op=op, result="auth",
-                ).observe(elapsed[0])
-                raise
-            except GravitinoError:
-                GRAVITINO_REQUEST_DURATION().labels(
-                    op=op, result="error",
-                ).observe(elapsed[0])
-                raise
-            else:
-                GRAVITINO_REQUEST_DURATION().labels(
-                    op=op, result="success",
-                ).observe(elapsed[0])
-
-    def _fileset_collection_path(self, schema: str) -> str:
-        return (
-            f"/api/metalakes/{self._metalake}"
-            f"/catalogs/{self._catalog}"
-            f"/schemas/{schema}"
-            f"/filesets"
+    async def list_schemas(self) -> list[str]:
+        """Return schema names in the configured catalog."""
+        self._require_enabled()
+        url = (
+            f"{self._base_url}/api/metalakes/{self._metalake}"
+            f"/catalogs/{self._catalog}/schemas"
         )
-
-    async def _get_json(self, path: str) -> dict[str, Any]:
-        try:
-            response = await self._http.get(path)
-        except httpx.HTTPError as exc:
-            raise GravitinoError(f"GET {path} failed: {exc}") from exc
-        return self._parse(response, path=path, method="GET")
-
-    async def _put_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
-        try:
-            response = await self._http.put(path, json=body)
-        except httpx.HTTPError as exc:
-            raise GravitinoError(f"PUT {path} failed: {exc}") from exc
-        return self._parse(response, path=path, method="PUT")
-
-    @staticmethod
-    def _parse(response: httpx.Response, *, path: str, method: str) -> dict[str, Any]:
-        """Translate HTTP status to typed exceptions; return JSON on success."""
-
-        status = response.status_code
-        if status == 404:
-            raise GravitinoNotFoundError(
-                f"{method} {path} -> 404", status=status,
-            )
-        if status in (401, 403):
-            raise GravitinoAuthError(
-                f"{method} {path} -> {status}", status=status,
-            )
-        if status >= 400:
-            # Surface the body for ops debuggability, capped to keep logs sane.
-            snippet = response.text[:512] if response.text else ""
-            raise GravitinoError(
-                f"{method} {path} -> {status}: {snippet}", status=status,
-            )
-
-        # 2xx with empty body is unusual but legal (e.g. 204).  We never
-        # call endpoints that return 204 today, so treat empty as ``{}``.
-        if not response.content:
-            return {}
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise GravitinoError(
-                f"{method} {path} -> {status} non-JSON body",
-                status=status,
-            ) from exc
-        if not isinstance(data, dict):
-            raise GravitinoError(
-                f"{method} {path} -> {status} expected JSON object, got {type(data).__name__}",
-                status=status,
-            )
-        return data
+        async with httpx.AsyncClient(timeout=self._timeout) as client:
+            resp = await client.get(url, headers=self._headers())
+            _check_response(resp)
+            data = resp.json()
+            identifiers = data.get("identifiers") or []
+            return [ident["name"] for ident in identifiers if "name" in ident]
 
 
-__all__ = [
-    "Fileset",
-    "GravitinoAuthError",
-    "GravitinoClient",
-    "GravitinoError",
-    "GravitinoNotFoundError",
-]
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _check_response(resp: httpx.Response) -> None:
+    """Raise :class:`GravitinoAPIError` on non-2xx."""
+    if resp.is_success:
+        return
+    detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+    raise GravitinoAPIError(resp.status_code, detail)
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_CLIENT: GravitinoClient | None = None
+
+
+def get_gravitino_client() -> GravitinoClient:
+    """Return the shared client singleton."""
+    global _CLIENT  # noqa: PLW0603
+    if _CLIENT is None:
+        _CLIENT = GravitinoClient()
+    return _CLIENT
+
+
+def reset_gravitino_client() -> None:
+    """Reset singleton (for tests)."""
+    global _CLIENT  # noqa: PLW0603
+    _CLIENT = None

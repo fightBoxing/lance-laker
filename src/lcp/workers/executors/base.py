@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Dataset, Task
 
 __all__ = [
@@ -81,10 +81,9 @@ class LifecycleExecutor(ABC):
 # ---------------------------------------------------------------------------
 
 
-def utcnow_naive() -> datetime:
-    """Return naive UTC -- matches the DDL ``DATETIME(3)`` columns."""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` is imported from ``lcp.core.time`` and re-exported here
+# so existing executor imports (``from .base import utcnow_naive``) keep
+# working without changes.
 
 
 # ---------------------------------------------------------------------------
@@ -110,11 +109,12 @@ def build_default_registry() -> dict[str, LifecycleExecutor]:
     from lcp.workers.executors.index_build import IndexBuildExecutor
     from lcp.workers.executors.index_optimize import IndexOptimizeExecutor
     from lcp.workers.executors.ttl_delete import TtlDeleteExecutor
+    from lcp.workers.executors.vectorize import VectorizationExecutor
 
     return {
         TtlDeleteExecutor.task_type: TtlDeleteExecutor(),
         CompactionExecutor.task_type: CompactionExecutor(),
         IndexBuildExecutor.task_type: IndexBuildExecutor(),
         IndexOptimizeExecutor.task_type: IndexOptimizeExecutor(),
-        EmbeddingExecutor.task_type: EmbeddingExecutor(),
+        VectorizationExecutor.task_type: VectorizationExecutor(),
     }

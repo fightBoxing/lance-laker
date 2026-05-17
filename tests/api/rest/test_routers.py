@@ -1014,125 +1014,44 @@ class TestVectorizationRouter:
 
 class TestMetaRouter:
 
-    async def test_trigger_meta_sync_503_when_gravitino_unconfigured(
+    async def test_trigger_meta_sync_returns_503_when_gravitino_disabled(
         self,
         http_client: Any,
         issue_token: Any,
     ) -> None:
-        # Default test settings leave LCP_GRAVITINO_URL empty, so the
-        # handler must refuse the request loudly instead of attempting
-        # a connection to a URL that does not exist.
+        """Without LCP_GRAVITINO_URL the sync endpoint returns 503."""
         token = issue_token(tenant_id="t-meta")
         resp = await http_client.post(
             "/v1/meta/sync",
             headers=_auth(token),
-            json={"scope": "ALL"},
         )
         assert resp.status_code == 503
-        assert resp.json()["detail"]["code"] == "GRAVITINO_NOT_CONFIGURED"
-
-    async def test_trigger_meta_sync_runs_when_configured(
-        self,
-        http_client: Any,
-        issue_token: Any,
-        monkeypatch: Any,
-    ) -> None:
-        # Point the client at a fake URL and patch the underlying
-        # GravitinoClient so the handler reconciles 0 datasets and
-        # returns a clean SUCCEEDED report.  This is a router-level
-        # integration check; service-level paths are covered exhaustively
-        # in tests/unit/services/test_meta_sync_service.py.
-        from lcp.api.rest.routers import meta as meta_router
-
-        monkeypatch.setenv(
-            "LCP_GRAVITINO_URL", "http://gravitino.test:8090",
-        )
-        # Bust the cached settings so the new env var is read.
-        from lcp.core.config import get_settings
-        get_settings.cache_clear()
-
-        # Replace GravitinoClient.from_settings with a stub that yields
-        # a no-op async context manager; the handler's reconcile_all
-        # then sees zero datasets and returns immediately.
-        class _NullClient:
-            async def __aenter__(self) -> "_NullClient":
-                return self
-
-            async def __aexit__(self, *_args: Any) -> None:
-                return None
-
-        monkeypatch.setattr(
-            meta_router.GravitinoClient,
-            "from_settings",
-            classmethod(lambda cls, settings=None: _NullClient()),
-        )
-
-        token = issue_token(tenant_id="t-meta-ok")
-        resp = await http_client.post(
-            "/v1/meta/sync",
-            headers=_auth(token),
-            json={"scope": "ALL"},
-        )
-
-        assert resp.status_code == 202
         body = resp.json()
-        assert body["status"] == "SUCCEEDED"
-        assert body["scanned"] == 0
-        assert body["sync_id"] == "sync-inline"
+        assert body["detail"]["code"] == "GRAVITINO_DISABLED"
 
-    async def test_trigger_meta_sync_rejects_catalog_scope(
+    async def test_list_schemas_returns_503_when_gravitino_disabled(
         self,
         http_client: Any,
         issue_token: Any,
-        monkeypatch: Any,
     ) -> None:
-        # CATALOG is reserved in the OpenAPI but not implemented; the
-        # router refuses with 400 instead of silently downgrading.
-        monkeypatch.setenv(
-            "LCP_GRAVITINO_URL", "http://gravitino.test:8090",
+        token = issue_token(tenant_id="t-meta-schemas")
+        resp = await http_client.get(
+            "/v1/meta/schemas",
+            headers=_auth(token),
         )
-        from lcp.core.config import get_settings
-        get_settings.cache_clear()
+        assert resp.status_code == 503
 
-        token = issue_token(tenant_id="t-meta-catalog")
+    async def test_write_back_returns_503_when_gravitino_disabled(
+        self,
+        http_client: Any,
+        issue_token: Any,
+    ) -> None:
+        token = issue_token(tenant_id="t-meta-wb")
         resp = await http_client.post(
-            "/v1/meta/sync",
-            headers=_auth(token),
-            json={"scope": "CATALOG"},
-        )
-        assert resp.status_code == 400
-        assert resp.json()["detail"]["code"] == "SCOPE_NOT_SUPPORTED"
-
-    async def test_get_meta_sync_status_still_returns_501(
-        self,
-        http_client: Any,
-        issue_token: Any,
-    ) -> None:
-        # Async run-id storage is not yet implemented; assert the
-        # handler emits the documented machine-readable code so clients
-        # can switch behaviour when the feature lands.
-        token = issue_token(tenant_id="t-meta-status")
-        resp = await http_client.get(
-            "/v1/meta/sync/run-1",
+            "/v1/meta/datasets/d-1/write-back",
             headers=_auth(token),
         )
-        assert resp.status_code == 501
-        assert resp.json()["detail"]["code"] == "ASYNC_RUNS_NOT_IMPLEMENTED"
-
-    async def test_get_dataset_snapshot_returns_404_when_unknown(
-        self,
-        http_client: Any,
-        issue_token: Any,
-    ) -> None:
-        # Snapshot endpoint now actually queries the dataset; verifying
-        # the 404 path is enough for router coverage (the happy path
-        # exercises the same RLS lookup as the datasets router).
-        token = issue_token(tenant_id="t-meta-snap")
-        resp = await http_client.get(
-            "/v1/meta/datasets/does-not-exist/snapshot",
-            headers=_auth(token),
-        )
-        assert resp.status_code == 404
+        assert resp.status_code == 503
 
 
 # ---------------------------------------------------------------------------
@@ -1168,9 +1087,9 @@ class TestRouteTableContract:
             "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/disable",
             "/v1/datasets/{dataset_uuid}/vectorization-rules/{target_column}/vectorize-now",
             "/v1/meta/sync",
-            "/v1/meta/sync/{run_id}",
-            "/v1/meta/datasets/{dataset_id}/snapshot",
-            "/v1/datasets/{dataset_uuid}/search",
+            "/v1/meta/schemas",
+            "/v1/meta/schemas/{schema}/filesets",
+            "/v1/meta/datasets/{dataset_uuid}/write-back",
             "/healthz",
         }
         missing = expected_subset - paths

@@ -30,13 +30,13 @@ index; the worker flips the row to ``READY`` once lance succeeds.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import Select, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lcp.core.time import utcnow_naive
 from lcp.db.models import Index
 from lcp.services import dataset_service, task_service
 
@@ -72,10 +72,7 @@ _MERGEABLE_STATES: frozenset[str] = frozenset({"READY"})
 _TERMINAL_STATES: frozenset[str] = frozenset({"DROPPED"})
 
 
-def _utcnow() -> datetime:
-    """Return naive UTC ``datetime`` matching the DATETIME(3) column type."""
-
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+# ``utcnow_naive`` is imported from ``lcp.core.time`` (shared utility).
 
 
 # ---------------------------------------------------------------------------
@@ -135,18 +132,29 @@ async def create_index(
     # exists before any worker could see the task.  Idempotency key:
     # ``build:<dataset>/<name>:<id>`` — the row ``id`` is stable and guards
     # against replays from retrying HTTP clients.
-    await task_service.submit_task(
-        session,
-        task_type="INDEX_BUILD",
-        dataset_uuid=dataset_uuid,
-        params={
-            "index_name": index_name,
-            "column_name": column_name,
-            "index_type": index_type,
-            "params": params or {},
-        },
-        idempotency_key=f"build:{dataset_uuid}/{index_name}:{obj.id}",
-    )
+    #
+    # Safety net: if task submission fails the index row is already
+    # committed in BUILDING state with no worker coming.  Catch any
+    # exception, flip the row to FAILED so callers can see what happened,
+    # and re-raise so the HTTP response is still an error.
+    try:
+        await task_service.submit_task(
+            session,
+            task_type="INDEX_BUILD",
+            dataset_uuid=dataset_uuid,
+            params={
+                "index_name": index_name,
+                "column_name": column_name,
+                "index_type": index_type,
+                "params": params or {},
+            },
+            idempotency_key=f"build:{dataset_uuid}/{index_name}:{obj.id}",
+        )
+    except Exception as exc:
+        obj.status = "FAILED"
+        obj.error_message = f"task submission failed: {exc}"
+        await session.commit()
+        raise
     return obj
 
 
@@ -181,11 +189,9 @@ async def list_indexes(
         await session.execute(base.order_by(Index.created_at.desc()))
     ).scalars().all()
 
-    count_stmt: Select[Any] = select(func.count(Index.id)).where(
-        Index.dataset_uuid == dataset_uuid,
-    )
-    total = (await session.execute(count_stmt)).scalar_one()
-    return items, int(total)
+    # No pagination: a single dataset rarely hosts hundreds of indexes;
+    # ``len(items)`` avoids an extra DB round-trip for COUNT.
+    return items, len(items)
 
 
 async def drop_index(
@@ -225,7 +231,7 @@ async def optimize_index(
             f"{sorted(_OPTIMIZABLE_STATES)} states allow optimize",
         )
     obj.status = "OPTIMIZING"
-    obj.last_optimized_at = _utcnow()
+    obj.last_optimized_at = utcnow_naive()
     await session.commit()
     await session.refresh(obj)
 
@@ -235,16 +241,26 @@ async def optimize_index(
     # row.  Idempotency key keys off the row id AND the optimize stamp so a
     # second optimize of the same index after it goes READY again gets a
     # fresh task; HTTP retries within the same flip dedupe.
-    await task_service.submit_task(
-        session,
-        task_type="INDEX_OPTIMIZE",
-        dataset_uuid=dataset_uuid,
-        params={"index_name": index_name},
-        idempotency_key=(
-            f"optimize:{dataset_uuid}/{index_name}:"
-            f"{obj.id}:{obj.last_optimized_at.isoformat()}"
-        ),
-    )
+    #
+    # Safety net: if task submission fails the index is stuck in OPTIMIZING.
+    # Roll it back to READY and re-raise so the HTTP response is still an
+    # error and the caller can retry cleanly.
+    try:
+        await task_service.submit_task(
+            session,
+            task_type="INDEX_OPTIMIZE",
+            dataset_uuid=dataset_uuid,
+            params={"index_name": index_name},
+            idempotency_key=(
+                f"optimize:{dataset_uuid}/{index_name}:"
+                f"{obj.id}:{obj.last_optimized_at.isoformat()}"
+            ),
+        )
+    except Exception as exc:
+        obj.status = "READY"
+        obj.error_message = f"task submission failed: {exc}"
+        await session.commit()
+        raise
     return obj
 
 
@@ -262,7 +278,7 @@ async def merge_index(
             f"{sorted(_MERGEABLE_STATES)} states allow merge",
         )
     obj.status = "MERGING"
-    obj.last_merged_at = _utcnow()
+    obj.last_merged_at = utcnow_naive()
     await session.commit()
     await session.refresh(obj)
     return obj

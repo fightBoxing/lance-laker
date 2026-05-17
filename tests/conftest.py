@@ -22,24 +22,26 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 @pytest.fixture(autouse=True)
-def _reset_lru_caches() -> Iterator[None]:
-    """Clear all module-level caches between tests for isolation."""
+def _reset_singletons() -> Iterator[None]:
+    """Reset all module-level singletons between tests for isolation."""
 
-    from lcp.core.config import get_settings
-    from lcp.core.security import reset_jwks_cache_for_tests
+    from lcp.core.config import reset_settings
+    from lcp.core.security import reset_jti_denylist_for_tests, reset_jwks_cache_for_tests
     from lcp.core.tenant import _current_tenant
-    from lcp.db.session import get_engine, get_session_factory
+    from lcp.db.session import reset_engine, reset_session_factory
 
-    get_settings.cache_clear()
+    reset_settings()
     reset_jwks_cache_for_tests()
+    reset_jti_denylist_for_tests()
     _current_tenant.set(None)  # belt-and-braces: drop any leaked principal
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
+    reset_engine()
+    reset_session_factory()
     yield
-    get_settings.cache_clear()
+    reset_settings()
     reset_jwks_cache_for_tests()
-    get_engine.cache_clear()
-    get_session_factory.cache_clear()
+    reset_jti_denylist_for_tests()
+    reset_engine()
+    reset_session_factory()
 
 
 # ---------------------------------------------------------------------------
@@ -175,8 +177,8 @@ async def rest_app(configured_settings: None, patch_jwks: None) -> AsyncIterator
 
     # Create the ORM schema in the in-memory sqlite DB and install the RLS hook
     # so the handlers that hit the DB behave like production.  ``rest_app`` is
-    # function-scoped, so the engine cache was already cleared by the
-    # ``_reset_lru_caches`` autouse fixture in this module.
+    # function-scoped, so the singletons were already reset by the
+    # ``_reset_singletons`` autouse fixture in this module.
     engine = get_engine()
     install_rls_listener(engine.sync_engine)
     async with engine.begin() as conn:
