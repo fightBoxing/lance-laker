@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import ssl
 
@@ -94,8 +95,6 @@ async def _serve(*, insecure: bool) -> None:
         host=settings.rest_host,
         port=settings.rest_port,
         log_level="info",
-        # Disable Uvicorn's own signal handling; we install our own below.
-        install_signal_handlers=False,
     )
     uvi_server = uvicorn.Server(uvi_config)
 
@@ -118,7 +117,7 @@ async def _serve(*, insecure: bool) -> None:
         insecure,
     )
 
-    # Run both; when either exits the other is stopped.
+    # Setup signal handlers for graceful shutdown.
     shutdown = asyncio.Event()
 
     def _signal_handler() -> None:
@@ -136,8 +135,10 @@ async def _serve(*, insecure: bool) -> None:
             pass  # Windows fallback
 
     try:
+        # Call uvicorn._serve() directly to bypass capture_signals();
+        # we're managing signals ourselves via loop.add_signal_handler().
         await asyncio.gather(
-            uvi_server.serve(),
+            uvi_server._serve(),
             grpc_server.wait_for_termination(),
         )
     finally:
