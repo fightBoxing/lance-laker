@@ -175,6 +175,30 @@ class Settings(BaseSettings):
         default=30.0,
         description="HTTP timeout for embedding model calls.",
     )
+    # API key for third-party embedding services (OpenAI, Cohere, Zhipu,
+    # Dashscope, etc.).  Sent as ``Authorization: Bearer <key>`` header.
+    # VectorizationRule rows can override this per-rule via the ``extra``
+    # JSON field (key: "api_key"); this setting provides the global fallback.
+    embedding_api_key: str = Field(
+        default="",
+        description=(
+            "Default API key for third-party embedding model services. "
+            "Sent as Bearer token in the Authorization header. "
+            "Leave empty for self-hosted models that need no auth."
+        ),
+    )
+    # Some providers use a custom header name (e.g. "X-Api-Key" for Cohere,
+    # "Api-Key" for Azure OpenAI).  This setting controls the header name;
+    # the value is always ``embedding_api_key``.
+    embedding_api_key_header: str = Field(
+        default="Authorization",
+        description=(
+            "HTTP header name for the API key. "
+            "Use 'Authorization' for OpenAI-compatible (sends 'Bearer <key>'). "
+            "Use 'X-Api-Key' for Cohere. "
+            "Use 'Api-Key' for Azure OpenAI."
+        ),
+    )
 
     def model_post_init(self, __context: object) -> None:  # noqa: ANN001
         """Warn on unrecognised ``LCP_``-prefixed environment variables.

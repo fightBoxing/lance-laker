@@ -74,6 +74,17 @@ class VectorizationExecutor(LifecycleExecutor):
                 },
             )
 
+        # Resolve API key: rule-level (extra.api_key) > global default.
+        rule_extra = params.get("extra") or {}
+        api_key = (
+            rule_extra.get("api_key")
+            or settings.embedding_api_key
+        )
+        api_key_header = (
+            rule_extra.get("api_key_header")
+            or settings.embedding_api_key_header
+        )
+
         # Run the CPU/IO-heavy lance + HTTP work in a thread to avoid blocking.
         result = await asyncio.to_thread(
             _vectorize_sync,
@@ -84,6 +95,8 @@ class VectorizationExecutor(LifecycleExecutor):
             endpoint=endpoint,
             batch_size=batch_size,
             timeout=settings.embedding_request_timeout_seconds,
+            api_key=api_key,
+            api_key_header=api_key_header,
         )
         return ExecutorResult(payload=result)
 
@@ -97,13 +110,15 @@ def _vectorize_sync(
     endpoint: str,
     batch_size: int,
     timeout: float,
+    api_key: str = "",
+    api_key_header: str = "Authorization",
 ) -> dict[str, Any]:
     """Synchronous vectorization logic (runs in thread via to_thread).
 
     Steps:
     1. Open lance dataset.
     2. Scan rows where target_column is null.
-    3. Batch-call embedding endpoint.
+    3. Batch-call embedding endpoint with API key auth.
     4. Update rows with computed vectors.
     """
 
@@ -148,6 +163,16 @@ def _vectorize_sync(
 
     import httpx as _httpx  # thread-safe sync client
 
+    # Build request headers with optional API key authentication.
+    # Supports: OpenAI ("Authorization: Bearer <key>"), Cohere ("X-Api-Key: <key>"),
+    # Azure OpenAI ("Api-Key: <key>"), and any custom header.
+    req_headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        if api_key_header.lower() == "authorization":
+            req_headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            req_headers[api_key_header] = api_key
+
     with _httpx.Client(timeout=timeout) as client:
         for start in range(0, len(texts), batch_size):
             batch_texts = texts[start : start + batch_size]
@@ -155,7 +180,7 @@ def _vectorize_sync(
                 resp = client.post(
                     endpoint,
                     json={"input": batch_texts, "model": model_name},
-                    headers={"Content-Type": "application/json"},
+                    headers=req_headers,
                 )
                 resp.raise_for_status()
                 data = resp.json()
