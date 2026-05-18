@@ -51,3 +51,7 @@ pytest-report.xml
 # Logs & temp
 *.log
 .codebuddy/
+
+# OpenWolf & Claude Code local state
+.wolf/
+.claude/
